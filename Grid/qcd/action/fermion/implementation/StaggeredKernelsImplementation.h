@@ -293,7 +293,16 @@ void StaggeredKernels<Impl>::DhopImproved(StencilImpl &st, LebesgueOrder &lo,
   }
   assert(0 && " Kernel optimisation case not covered ");
 }
-template <class Impl> 
+
+#define ASM_CALL_NAIVE(A)                            \
+  const uint64_t    NN = Nsite*Ls;                    \
+  thread_for( ss, NN, {                            \
+      int sF = ss;                            \
+      int sU = ss/Ls;                            \
+      ThisKernel::A(st_v,U_v,buf,sF,sU,in_v,out_v,dag);        \
+  });
+
+template <class Impl>
 void StaggeredKernels<Impl>::DhopNaive(StencilImpl &st, LebesgueOrder &lo, 
 				       DoubledGaugeField &U,
 				       const FermionField &in, FermionField &out, int dag, int interior,int exterior)
@@ -319,6 +328,9 @@ void StaggeredKernels<Impl>::DhopNaive(StencilImpl &st, LebesgueOrder &lo,
   if( interior && exterior ) { 
     if (Opt == OptGeneric    ) { KERNEL_CALL(DhopSiteGeneric,0); return;}
     if (Opt == OptHandUnroll ) { KERNEL_CALL(DhopSiteHand,0);    return;}
+#ifndef GRID_CUDA
+    if (Opt == OptInlineAsm  ) {  ASM_CALL_NAIVE(DhopSiteAsm);     return;}
+#endif
   } else if( interior ) {
     if (Opt == OptGeneric    ) { KERNEL_CALL(DhopSiteGenericInt,0); return;}
     if (Opt == OptHandUnroll ) { KERNEL_CALL(DhopSiteHandInt,0);    return;}

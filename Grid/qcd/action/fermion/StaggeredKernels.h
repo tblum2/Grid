@@ -112,6 +112,11 @@ template<class Impl> class StaggeredKernels : public FermionOperator<Impl> , pub
 		    DoubledGaugeFieldView &U,DoubledGaugeFieldView &UUU, 
 		    SiteSpinor * buf, int LLs, int sU, 
 		    const FermionFieldView &in, FermionFieldView &out,int dag);
+    
+   void DhopSiteAsm(StencilView &st,
+            DoubledGaugeFieldView &U,
+            SiteSpinor * buf, int LLs, int sU,
+            const FermionFieldView &in, FermionFieldView &out,int dag);
   
 public:
 
