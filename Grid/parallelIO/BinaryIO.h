@@ -541,7 +541,8 @@ class BinaryIO {
               while (new_layout[3] > nrank){
                 new_layout[3] /= 2;
               }
-              qlat::clear_shuffled_fields_reader_cache();
+              // remove the following line?
+              //qlat::clear_shuffled_fields_reader_cache();
               qlat::get_shuffled_fields_writer(filename, new_layout, false, true);
               if (sizeof(fobj) == 3*sizeof(Complex)) {
                   qlat::Field<Complex> f;
