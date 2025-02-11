@@ -382,7 +382,6 @@ class BinaryIO {
               assert(pos>0);
               std::string filename=file.substr(0,pos)+"evecs";
               std::string tag = file.substr(pos);
-              bool& qlatbegin = has_qlat_begin();
               qlat::Coordinate qcoor;
               qlat::Coordinate qsizes;
               qsizes[0]=psizes[0];
@@ -393,10 +392,7 @@ class BinaryIO {
               qcoor[1]=pcoor[1];
               qcoor[2]=pcoor[2];
               qcoor[3]=pcoor[3];
-              if(!qlatbegin){
-                  qlatbegin=true;
-                  qlat::begin(qlat::index_from_coordinate(qcoor,qsizes),qsizes);
-              }
+              qlat::begin_once(qlat::index_from_coordinate(qcoor,qsizes),qsizes);
               std::cout<< GridLogMessage<<"IOobject: Shuffle read "<< filename << std::endl;
               qlat::Coordinate grid_layout;
               grid_layout[0]=gLattice[0];
