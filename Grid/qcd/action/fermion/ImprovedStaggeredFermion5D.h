@@ -100,7 +100,6 @@ public:
 		     int dag);
     
   void DhopInternal(StencilImpl & st,
-		    LebesgueOrder &lo,
 		    DoubledGaugeField &U,
 		    DoubledGaugeField &UUU,
 		    const FermionField &in, 
@@ -108,7 +107,6 @@ public:
 		    int dag);
     
     void DhopInternalOverlappedComms(StencilImpl & st,
-		      LebesgueOrder &lo,
 		      DoubledGaugeField &U,
 		      DoubledGaugeField &UUU,
 		      const FermionField &in, 
@@ -116,7 +114,6 @@ public:
 		      int dag);
 
     void DhopInternalSerialComms(StencilImpl & st,
-		      LebesgueOrder &lo,
 		      DoubledGaugeField &U,
 		      DoubledGaugeField &UUU,
 		      const FermionField &in, 
@@ -182,6 +179,12 @@ public:
   StencilImpl Stencil; 
   StencilImpl StencilEven; 
   StencilImpl StencilOdd; 
+  void SloppyComms(int sloppy)
+  {
+    Stencil.SetSloppyComms(sloppy);
+    StencilEven.SetSloppyComms(sloppy);
+    StencilOdd.SetSloppyComms(sloppy);
+  }
     
   // Copy of the gauge field , with even and odd subsets
   DoubledGaugeField Umu;
@@ -192,8 +195,6 @@ public:
   DoubledGaugeField UUUmuEven;
   DoubledGaugeField UUUmuOdd;
     
-  LebesgueOrder Lebesgue;
-  LebesgueOrder LebesgueEvenOdd;
     
   // Comms buffer
   //  std::vector<SiteHalfSpinor,alignedAllocator<SiteHalfSpinor> >  comm_buf;

@@ -14,6 +14,7 @@ Author: paboyle <paboyle@ph.ed.ac.uk>
 Author: Guido Cossu <guido.cossu@ed.ac.uk>
 Author: Andrew Lawson <andrew.lawson1991@gmail.com>
 Author: Vera Guelpers <V.M.Guelpers@soton.ac.uk>
+Author: Christoph Lehner <christoph@lhnr.de>
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -58,15 +59,9 @@ WilsonFermion5D<Impl>::WilsonFermion5D(GaugeField &_Umu,
   Umu(_FourDimGrid),
   UmuEven(_FourDimRedBlackGrid),
   UmuOdd (_FourDimRedBlackGrid),
-  Lebesgue(_FourDimGrid),
-  LebesgueEvenOdd(_FourDimRedBlackGrid),
   _tmp(&FiveDimRedBlackGrid),
   Dirichlet(0)
 {
-  Stencil.lo     = &Lebesgue;
-  StencilEven.lo = &LebesgueEvenOdd;
-  StencilOdd.lo  = &LebesgueEvenOdd;
-  
   // some assertions
   assert(FiveDimGrid._ndimension==5);
   assert(FourDimGrid._ndimension==4);
@@ -305,19 +300,19 @@ void WilsonFermion5D<Impl>::DhopDerivOE(GaugeField &mat,
 }
 
 template<class Impl>
-void WilsonFermion5D<Impl>::DhopInternal(StencilImpl & st, LebesgueOrder &lo,
+void WilsonFermion5D<Impl>::DhopInternal(StencilImpl & st,
                                          DoubledGaugeField & U,
                                          const FermionField &in, FermionField &out,int dag)
 {
   if ( WilsonKernelsStatic::Comms == WilsonKernelsStatic::CommsAndCompute )
-    DhopInternalOverlappedComms(st,lo,U,in,out,dag);
+    DhopInternalOverlappedComms(st,U,in,out,dag);
   else 
-    DhopInternalSerialComms(st,lo,U,in,out,dag);
+    DhopInternalSerialComms(st,U,in,out,dag);
 }
 
 
 template<class Impl>
-void WilsonFermion5D<Impl>::DhopInternalOverlappedComms(StencilImpl & st, LebesgueOrder &lo,
+void WilsonFermion5D<Impl>::DhopInternalOverlappedComms(StencilImpl & st,
 							DoubledGaugeField & U,
 							const FermionField &in, FermionField &out,int dag)
 {
@@ -331,22 +326,22 @@ void WilsonFermion5D<Impl>::DhopInternalOverlappedComms(StencilImpl & st, Lebesg
   // Start comms  // Gather intranode and extra node differentiated??
   /////////////////////////////
   {
+    //    std::cout << " WilsonFermion5D gather " <<std::endl;
     GRID_TRACE("Gather");
     st.HaloExchangeOptGather(in,compressor); // Put the barrier in the routine
   }
   
+  //  std::cout << " WilsonFermion5D Communicate Begin " <<std::endl;
   std::vector<std::vector<CommsRequest_t> > requests;
-  auto id=traceStart("Communicate overlapped");
-  st.CommunicateBegin(requests);
 
+#if 1
   /////////////////////////////
   // Overlap with comms
   /////////////////////////////
-  {
-    GRID_TRACE("MergeSHM");
-    st.CommsMergeSHM(compressor);// Could do this inside parallel region overlapped with comms
-  }
-      
+  st.CommunicateBegin(requests);
+  st.CommsMergeSHM(compressor);// Could do this inside parallel region overlapped with comms 
+#endif
+
   /////////////////////////////
   // do the compute interior
   /////////////////////////////
@@ -358,22 +353,35 @@ void WilsonFermion5D<Impl>::DhopInternalOverlappedComms(StencilImpl & st, Lebesg
     GRID_TRACE("DhopInterior");
     Kernels::DhopKernel   (Opt,st,U,st.CommBuf(),LLs,U.oSites(),in,out,1,0);
   }
-
+  
+  //ifdef GRID_ACCELERATED
+#if 0
+  /////////////////////////////
+  // Overlap with comms -- on GPU the interior kernel call is nonblocking
+  /////////////////////////////
+  st.CommunicateBegin(requests);
+  st.CommsMergeSHM(compressor);// Could do this inside parallel region overlapped with comms
+#endif
+  
+  
   /////////////////////////////
   // Complete comms
   /////////////////////////////
+  //  std::cout << " WilsonFermion5D Comms Complete " <<std::endl;
   st.CommunicateComplete(requests);
-  traceStop(id);
+  //  traceStop(id);
 
   /////////////////////////////
   // do the compute exterior
   /////////////////////////////
   {
+    //    std::cout << " WilsonFermion5D Comms Merge " <<std::endl;
     GRID_TRACE("Merge");
     st.CommsMerge(compressor);
   }
   
 
+  //  std::cout << " WilsonFermion5D Exterior " <<std::endl;
   if (dag == DaggerYes) {
     GRID_TRACE("DhopDagExterior");
     Kernels::DhopDagKernel(Opt,st,U,st.CommBuf(),LLs,U.oSites(),in,out,0,1);
@@ -381,11 +389,12 @@ void WilsonFermion5D<Impl>::DhopInternalOverlappedComms(StencilImpl & st, Lebesg
     GRID_TRACE("DhopExterior");
     Kernels::DhopKernel   (Opt,st,U,st.CommBuf(),LLs,U.oSites(),in,out,0,1);
   }
+  //  std::cout << " WilsonFermion5D Done " <<std::endl;
 }
 
 
 template<class Impl>
-void WilsonFermion5D<Impl>::DhopInternalSerialComms(StencilImpl & st, LebesgueOrder &lo,
+void WilsonFermion5D<Impl>::DhopInternalSerialComms(StencilImpl & st, 
 						    DoubledGaugeField & U,
 						    const FermionField &in, 
 						    FermionField &out,int dag)
@@ -395,11 +404,13 @@ void WilsonFermion5D<Impl>::DhopInternalSerialComms(StencilImpl & st, LebesgueOr
 
   int LLs = in.Grid()->_rdimensions[0];
 
+  //  std::cout << " WilsonFermion5D Halo exch " <<std::endl;
   {
     GRID_TRACE("HaloExchange");
     st.HaloExchangeOpt(in,compressor);
   }
   
+  //  std::cout << " WilsonFermion5D Dhop " <<std::endl;
   int Opt = WilsonKernelsStatic::Opt;
   if (dag == DaggerYes) {
     GRID_TRACE("DhopDag");
@@ -408,6 +419,7 @@ void WilsonFermion5D<Impl>::DhopInternalSerialComms(StencilImpl & st, LebesgueOr
     GRID_TRACE("Dhop");
     Kernels::DhopKernel(Opt,st,U,st.CommBuf(),LLs,U.oSites(),in,out);
   }
+  //  std::cout << " WilsonFermion5D Done " <<std::endl;
 }
 
 
@@ -420,7 +432,7 @@ void WilsonFermion5D<Impl>::DhopOE(const FermionField &in, FermionField &out,int
   assert(in.Checkerboard()==Even);
   out.Checkerboard() = Odd;
 
-  DhopInternal(StencilEven,LebesgueEvenOdd,UmuOdd,in,out,dag);
+  DhopInternal(StencilEven,UmuOdd,in,out,dag);
 }
 template<class Impl>
 void WilsonFermion5D<Impl>::DhopEO(const FermionField &in, FermionField &out,int dag)
@@ -431,8 +443,31 @@ void WilsonFermion5D<Impl>::DhopEO(const FermionField &in, FermionField &out,int
   assert(in.Checkerboard()==Odd);
   out.Checkerboard() = Even;
 
-  DhopInternal(StencilOdd,LebesgueEvenOdd,UmuEven,in,out,dag);
+  DhopInternal(StencilOdd,UmuEven,in,out,dag);
 }
+template<class Impl>
+void WilsonFermion5D<Impl>::DhopComms(const FermionField &in, FermionField &out)
+{
+  int dag =0 ;
+  conformable(in.Grid(),FermionGrid()); // verifies full grid
+  conformable(in.Grid(),out.Grid());
+  out.Checkerboard() = in.Checkerboard();
+  Compressor compressor(dag);
+  Stencil.HaloExchangeOpt(in,compressor);
+}
+template<class Impl>
+void WilsonFermion5D<Impl>::DhopCalc(const FermionField &in, FermionField &out,uint64_t *ids)
+{
+  conformable(in.Grid(),FermionGrid()); // verifies full grid
+  conformable(in.Grid(),out.Grid());
+
+  out.Checkerboard() = in.Checkerboard();
+
+  int LLs = in.Grid()->_rdimensions[0];
+  int Opt = WilsonKernelsStatic::Opt;
+  Kernels::DhopKernel(Opt,Stencil,Umu,Stencil.CommBuf(),LLs,Umu.oSites(),in,out,ids);
+}
+
 template<class Impl>
 void WilsonFermion5D<Impl>::Dhop(const FermionField &in, FermionField &out,int dag)
 {
@@ -441,7 +476,7 @@ void WilsonFermion5D<Impl>::Dhop(const FermionField &in, FermionField &out,int d
 
   out.Checkerboard() = in.Checkerboard();
 
-  DhopInternal(Stencil,Lebesgue,Umu,in,out,dag);
+  DhopInternal(Stencil,Umu,in,out,dag);
 }
 template<class Impl>
 void WilsonFermion5D<Impl>::DW(const FermionField &in, FermionField &out,int dag)
@@ -449,6 +484,54 @@ void WilsonFermion5D<Impl>::DW(const FermionField &in, FermionField &out,int dag
   out.Checkerboard()=in.Checkerboard();
   Dhop(in,out,dag); // -0.5 is included
   axpy(out,4.0-M5,in,out);
+}
+template <class Impl>
+void WilsonFermion5D<Impl>::Meooe(const FermionField &in, FermionField &out)
+{
+  if (in.Checkerboard() == Odd) {
+    DhopEO(in, out, DaggerNo);
+  } else {
+    DhopOE(in, out, DaggerNo);
+  }
+}
+
+template <class Impl>
+void WilsonFermion5D<Impl>::MeooeDag(const FermionField &in, FermionField &out)
+{
+  if (in.Checkerboard() == Odd) {
+    DhopEO(in, out, DaggerYes);
+  } else {
+    DhopOE(in, out, DaggerYes);
+  }
+}
+
+template <class Impl>
+void WilsonFermion5D<Impl>::Mooee(const FermionField &in, FermionField &out)
+{
+  out.Checkerboard() = in.Checkerboard();
+  typename FermionField::scalar_type scal(4.0 + M5);
+  out = scal * in;
+}
+
+template <class Impl>
+void WilsonFermion5D<Impl>::MooeeDag(const FermionField &in, FermionField &out)
+{
+  out.Checkerboard() = in.Checkerboard();
+  Mooee(in, out);
+}
+
+template<class Impl>
+void WilsonFermion5D<Impl>::MooeeInv(const FermionField &in, FermionField &out)
+{
+  out.Checkerboard() = in.Checkerboard();
+  out = (1.0/(4.0 + M5))*in;
+}
+
+template<class Impl>
+void WilsonFermion5D<Impl>::MooeeInvDag(const FermionField &in, FermionField &out)
+{
+  out.Checkerboard() = in.Checkerboard();
+  MooeeInv(in,out);
 }
 
 template<class Impl>
@@ -736,6 +819,15 @@ void WilsonFermion5D<Impl>::MomentumSpacePropagatorHt(FermionField &out,const Fe
 template<class Impl>
 void WilsonFermion5D<Impl>::MomentumSpacePropagatorHw(FermionField &out,const FermionField &in,RealD mass,std::vector<double> twist)
 {
+  std::vector<double> empty_q(Nd,0.0);
+  MomentumSpacePropagatorHwQ(out,in,mass,twist,empty_q);
+}
+template<class Impl>
+void WilsonFermion5D<Impl>::MomentumSpacePropagatorHwQ(FermionField &out,const FermionField &in,
+						       RealD mass,
+						       std::vector<double> twist,
+						       std::vector<double> qmu)
+{
     Gamma::Algebra Gmu [] = {
       Gamma::Algebra::GammaX,
       Gamma::Algebra::GammaY,
@@ -750,6 +842,7 @@ void WilsonFermion5D<Impl>::MomentumSpacePropagatorHw(FermionField &out,const Fe
     typedef typename FermionField::scalar_type ScalComplex;
 
     typedef Lattice<iSinglet<vector_type> > LatComplex;
+    typedef iSpinMatrix<ScalComplex> SpinMat;
 
 
     Coordinate latt_size   = _grid->_fdimensions;
@@ -767,8 +860,10 @@ void WilsonFermion5D<Impl>::MomentumSpacePropagatorHw(FermionField &out,const Fe
     LatComplex kmu(_grid); 
     ScalComplex ci(0.0,1.0);
 
+    std::cout<< "Feynman Rule" << "qmu ("<<qmu[0]<<","<<qmu[1]<<","<<qmu[2]<<","<<qmu[3]<<")"<<std::endl;
+    
     for(int mu=0;mu<Nd;mu++) {
-
+      
       LatticeCoordinate(kmu,mu);
 
       RealD TwoPiL =  M_PI * 2.0/ latt_size[mu];
@@ -777,9 +872,18 @@ void WilsonFermion5D<Impl>::MomentumSpacePropagatorHw(FermionField &out,const Fe
       kmu = kmu + TwoPiL * one * twist[mu];//momentum for twisted boundary conditions
 
       sk2 = sk2 + 2.0*sin(kmu*0.5)*sin(kmu*0.5);
-      sk  = sk  + sin(kmu)*sin(kmu); 
 
-      num = num - sin(kmu)*ci*(Gamma(Gmu[mu])*in);
+      sk = sk + (sin(kmu)+qmu[mu])*(sin(kmu)+qmu[mu]); 
+
+      // Terms for boosted Fermion
+      // 1/2 [ -i gamma.(sin p + q )     ]
+      //     [ --------------------- + 1 ]
+      //     [         wq + b            ]
+      //
+      // wq = sqrt( (sinp+q)^2 + b^2 )
+      //
+      
+      num = num - (sin(kmu)+qmu[mu])*ci*(Gamma(Gmu[mu])*in);
 
     }
     num = num + mass * in ;

@@ -43,6 +43,11 @@ class WilsonGaugeAction : public Action<typename Gimpl::GaugeField> {
 public:  
   INHERIT_GIMPL_TYPES(Gimpl);
 
+  using Action<GaugeField>::S;
+  using Action<GaugeField>::Sinitial;
+  using Action<GaugeField>::deriv;
+  using Action<GaugeField>::refresh;
+  
   /////////////////////////// constructors
   explicit WilsonGaugeAction(RealD beta_):beta(beta_){};
 
@@ -68,20 +73,23 @@ public:
     // extend Ta to include Lorentz indexes
 
     RealD factor = 0.5 * beta / RealD(Nc);
+    GridBase *grid = U.Grid();
 
-    GaugeLinkField Umu(U.Grid());
-    GaugeLinkField dSdU_mu(U.Grid());
+    GaugeLinkField dSdU_mu(grid);
+    std::vector<GaugeLinkField> Umu(Nd, grid);
     for (int mu = 0; mu < Nd; mu++) {
+      Umu[mu] = PeekIndex<LorentzIndex>(U, mu);
+    }
 
-      Umu = PeekIndex<LorentzIndex>(U, mu);
-      
+    for (int mu = 0; mu < Nd; mu++) {
       // Staple in direction mu
-      WilsonLoops<Gimpl>::Staple(dSdU_mu, U, mu);
-      dSdU_mu = Ta(Umu * dSdU_mu) * factor;
-      
+      WilsonLoops<Gimpl>::Staple(dSdU_mu, Umu, mu);
+      dSdU_mu = Ta(Umu[mu] * dSdU_mu) * factor;
+
       PokeIndex<LorentzIndex>(dSdU, dSdU_mu, mu);
     }
   }
+
 private:
   RealD beta;  
  };

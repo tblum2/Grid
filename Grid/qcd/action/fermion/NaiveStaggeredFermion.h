@@ -102,11 +102,11 @@ public:
 		     GaugeField &mat, 
 		     const FermionField &A, const FermionField &B, int dag);
 
-  void DhopInternal(StencilImpl &st, LebesgueOrder &lo, DoubledGaugeField &U,
+  void DhopInternal(StencilImpl &st, DoubledGaugeField &U,
                     const FermionField &in, FermionField &out, int dag);
-  void DhopInternalSerialComms(StencilImpl &st, LebesgueOrder &lo, DoubledGaugeField &U,
+  void DhopInternalSerialComms(StencilImpl &st, DoubledGaugeField &U,
 			       const FermionField &in, FermionField &out, int dag);
-  void DhopInternalOverlappedComms(StencilImpl &st, LebesgueOrder &lo, DoubledGaugeField &U,
+  void DhopInternalOverlappedComms(StencilImpl &st, DoubledGaugeField &U,
 				   const FermionField &in, FermionField &out, int dag);
 
   //////////////////////////////////////////////////////////////////////////
@@ -146,15 +146,18 @@ public:
   StencilImpl Stencil;
   StencilImpl StencilEven;
   StencilImpl StencilOdd;
+  void SloppyComms(int sloppy)
+  {
+    Stencil.SetSloppyComms(sloppy);
+    StencilEven.SetSloppyComms(sloppy);
+    StencilOdd.SetSloppyComms(sloppy);
+  }
 
   // Copy of the gauge field , with even and odd subsets
   DoubledGaugeField Umu;
   DoubledGaugeField UmuEven;
   DoubledGaugeField UmuOdd;
 
-  LebesgueOrder Lebesgue;
-  LebesgueOrder LebesgueEvenOdd;
-  
   ///////////////////////////////////////////////////////////////
   // Conserved current utilities
   ///////////////////////////////////////////////////////////////

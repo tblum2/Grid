@@ -91,7 +91,7 @@ void CartesianCommunicator::SendToRecvFrom(void *xmit,
 {
   assert(0);
 }
-void CartesianCommunicator::CommsComplete(std::vector<CommsRequest_t> &list){ assert(0);}
+void CartesianCommunicator::CommsComplete(std::vector<CommsRequest_t> &list){ assert(list.size()==0);}
 void CartesianCommunicator::SendToRecvFromBegin(std::vector<CommsRequest_t> &list,
 						void *xmit,
 						int dest,
@@ -124,6 +124,8 @@ void CartesianCommunicator::ShiftedRanks(int dim,int shift,int &source,int &dest
   dest=0;
 }
 
+int CartesianCommunicator::IsOffNode(int rank) { return false; }
+
 double CartesianCommunicator::StencilSendToRecvFrom( void *xmit,
 						     int xmit_to_rank,int dox,
 						     void *recv,
@@ -131,6 +133,17 @@ double CartesianCommunicator::StencilSendToRecvFrom( void *xmit,
 						     int bytes, int dir)
 {
   return 2.0*bytes;
+}
+void CartesianCommunicator::StencilSendToRecvFromPollIRecv(std::vector<CommsRequest_t> &list) {};
+void CartesianCommunicator::StencilSendToRecvFromPollDtoH(std::vector<CommsRequest_t> &list) {};
+double CartesianCommunicator::StencilSendToRecvFromPrepare(std::vector<CommsRequest_t> &list,
+							   void *xmit,
+							   int xmit_to_rank,int dox,
+							   void *recv,
+							   int recv_from_rank,int dor,
+							   int xbytes,int rbytes, int dir)
+{
+  return 0.0;
 }
 double CartesianCommunicator::StencilSendToRecvFromBegin(std::vector<CommsRequest_t> &list,
 							 void *xmit,
