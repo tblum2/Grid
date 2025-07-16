@@ -29,8 +29,12 @@ Author: paboyle <paboyle@ph.ed.ac.uk>
 #ifndef _GRID_CSHIFT_MPI_H_
 #define _GRID_CSHIFT_MPI_H_
 
-
 NAMESPACE_BEGIN(Grid); 
+
+#ifdef GRID_CHECKSUM_COMMS
+extern uint64_t checksum_index;
+#endif
+
 const int Cshift_verbose=0;
 template<class vobj> Lattice<vobj> Cshift(const Lattice<vobj> &rhs,int dimension,int shift)
 {
@@ -126,8 +130,9 @@ template<class vobj> void Cshift_comms(Lattice<vobj> &ret,const Lattice<vobj> &r
   static deviceVector<vobj> send_buf; send_buf.resize(buffer_size);
   static deviceVector<vobj> recv_buf; recv_buf.resize(buffer_size);
 #ifndef ACCELERATOR_AWARE_MPI
-  static hostVector<vobj> hsend_buf; hsend_buf.resize(buffer_size);
-  static hostVector<vobj> hrecv_buf; hrecv_buf.resize(buffer_size);
+  int pad = (8 + sizeof(vobj) - 1) / sizeof(vobj);
+  static hostVector<vobj> hsend_buf; hsend_buf.resize(buffer_size+pad);
+  static hostVector<vobj> hrecv_buf; hrecv_buf.resize(buffer_size+pad);
 #endif
   
   int cb= (cbmask==0x2)? Odd : Even;
@@ -143,9 +148,11 @@ template<class vobj> void Cshift_comms(Lattice<vobj> &ret,const Lattice<vobj> &r
     int comm_proc = ((x+sshift)/rd)%pd;
     
     if (comm_proc==0) {
+      FlightRecorder::StepLog("Cshift_Copy_plane");
       tcopy-=usecond();
       Copy_plane(ret,rhs,dimension,x,sx,cbmask); 
       tcopy+=usecond();
+      FlightRecorder::StepLog("Cshift_Copy_plane_complete");
     } else {
 
       int words = buffer_size;
@@ -153,9 +160,11 @@ template<class vobj> void Cshift_comms(Lattice<vobj> &ret,const Lattice<vobj> &r
 
       int bytes = words * sizeof(vobj);
 
+      FlightRecorder::StepLog("Cshift_Gather_plane");
       tgather-=usecond();
       Gather_plane_simple (rhs,send_buf,dimension,sx,cbmask);
       tgather+=usecond();
+      FlightRecorder::StepLog("Cshift_Gather_plane_complete");
 
       //      int rank           = grid->_processor;
       int recv_from_rank;
@@ -166,6 +175,7 @@ template<class vobj> void Cshift_comms(Lattice<vobj> &ret,const Lattice<vobj> &r
       tcomms-=usecond();
       grid->Barrier();
 
+      FlightRecorder::StepLog("Cshift_SendRecv");
 #ifdef ACCELERATOR_AWARE_MPI
       grid->SendToRecvFrom((void *)&send_buf[0],
 			   xmit_to_rank,
@@ -175,17 +185,46 @@ template<class vobj> void Cshift_comms(Lattice<vobj> &ret,const Lattice<vobj> &r
 #else
       // bouncy bouncy
       acceleratorCopyFromDevice(&send_buf[0],&hsend_buf[0],bytes);
+
+#ifdef GRID_CHECKSUM_COMMS
+      assert(bytes % 8 == 0);
+      checksum_index++;
+      uint64_t xsum = checksum_gpu((uint64_t*)&send_buf[0], bytes / 8) ^ (1 + checksum_index);
+      *(uint64_t*)(((char*)&hsend_buf[0]) + bytes) = xsum;
+      bytes += 8;
+#endif
+
       grid->SendToRecvFrom((void *)&hsend_buf[0],
 			   xmit_to_rank,
 			   (void *)&hrecv_buf[0],
 			   recv_from_rank,
 			   bytes);
+
+#ifdef GRID_CHECKSUM_COMMS
+      bytes -= 8;
+      acceleratorCopyToDevice(&hrecv_buf[0],&recv_buf[0],bytes);
+      uint64_t expected_cs = *(uint64_t*)(((char*)&hrecv_buf[0]) + bytes);
+      uint64_t computed_cs = checksum_gpu((uint64_t*)&recv_buf[0], bytes / 8) ^ (1 + checksum_index);
+      std::cout << GridLogComms<< " Cshift: "
+		<<" dim"<<dimension
+		<<" shift "<<shift
+		<< " rank "<< grid->ThisRank()
+		<<" Coor "<<grid->ThisProcessorCoor()
+		<<" send "<<xsum<<" to   "<<xmit_to_rank
+		<<" recv "<<computed_cs<<" from "<<recv_from_rank
+		<<std::endl;
+      assert(expected_cs == computed_cs);
+#else
       acceleratorCopyToDevice(&hrecv_buf[0],&recv_buf[0],bytes);
 #endif
+
+#endif
+      FlightRecorder::StepLog("Cshift_SendRecv_complete");
 
       xbytes+=bytes;
       grid->Barrier();
       tcomms+=usecond();
+      FlightRecorder::StepLog("Cshift_barrier_complete");
 
       tscatter-=usecond();
       Scatter_plane_simple (ret,recv_buf,dimension,x,cbmask);
@@ -249,8 +288,16 @@ template<class vobj> void  Cshift_comms_simd(Lattice<vobj> &ret,const Lattice<vo
     recv_buf_extract[s].resize(buffer_size);
   }
 #ifndef ACCELERATOR_AWARE_MPI
-  hostVector<scalar_object> hsend_buf; hsend_buf.resize(buffer_size);
-  hostVector<scalar_object> hrecv_buf; hrecv_buf.resize(buffer_size);
+#ifdef GRID_CHECKSUM_COMMS
+  buffer_size += (8 + sizeof(vobj) - 1) / sizeof(vobj);
+#endif
+
+  static hostVector<vobj> hsend_buf; hsend_buf.resize(buffer_size);
+  static hostVector<vobj> hrecv_buf; hrecv_buf.resize(buffer_size);
+
+#ifdef GRID_CHECKSUM_COMMS
+  buffer_size -= (8 + sizeof(vobj) - 1) / sizeof(vobj);
+#endif
 #endif
   
   int bytes = buffer_size*sizeof(scalar_object);
@@ -313,12 +360,37 @@ template<class vobj> void  Cshift_comms_simd(Lattice<vobj> &ret,const Lattice<vo
 #else
       // bouncy bouncy
 	acceleratorCopyFromDevice((void *)send_buf_extract_mpi,(void *)&hsend_buf[0],bytes);
+#ifdef GRID_CHECKSUM_COMMS
+	assert(bytes % 8 == 0);
+	checksum_index++;
+	uint64_t xsum = checksum_gpu((uint64_t*)send_buf_extract_mpi, bytes / 8) ^ (1 + checksum_index);
+	*(uint64_t*)(((char*)&hsend_buf[0]) + bytes) = xsum;
+	bytes += 8;
+#endif
 	grid->SendToRecvFrom((void *)&hsend_buf[0],
 			     xmit_to_rank,
 			     (void *)&hrecv_buf[0],
 			     recv_from_rank,
 			     bytes);
+#ifdef GRID_CHECKSUM_COMMS
+	bytes -= 8;
 	acceleratorCopyToDevice((void *)&hrecv_buf[0],(void *)recv_buf_extract_mpi,bytes);
+	uint64_t expected_cs = *(uint64_t*)(((char*)&hrecv_buf[0]) + bytes);
+	uint64_t computed_cs = checksum_gpu((uint64_t*)recv_buf_extract_mpi, bytes / 8) ^ (1 + checksum_index);
+
+	std::cout << GridLogComms<< " Cshift_comms_simd: "
+		<<" dim"<<dimension
+		<<" shift "<<shift
+		<< " rank "<< grid->ThisRank()
+		<<" Coor "<<grid->ThisProcessorCoor()
+		<<" send "<<xsum<<" to   "<<xmit_to_rank
+		<<" recv "<<computed_cs<<" from "<<recv_from_rank
+		<<std::endl;
+	assert(expected_cs == computed_cs);
+#else
+	acceleratorCopyToDevice((void *)&hrecv_buf[0],(void *)recv_buf_extract_mpi,bytes);
+#endif
+
 #endif
 
 	xbytes+=bytes;

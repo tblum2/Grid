@@ -86,6 +86,7 @@ AC_ARG_WITH([gmp],
     [try this for a non-standard install prefix of the GMP library])],
     [AM_CXXFLAGS="-I$with_gmp/include $AM_CXXFLAGS"]
     [AM_LDFLAGS="-L$with_gmp/lib $AM_LDFLAGS"])
+
 AC_ARG_WITH([mpfr],
     [AS_HELP_STRING([--with-mpfr=prefix],
     [try this for a non-standard install prefix of the MPFR library])],
@@ -105,6 +106,13 @@ AC_ARG_WITH([lime],
             [try this for a non-standard install prefix of the LIME library])],
             [AM_CXXFLAGS="-I$with_lime/include $AM_CXXFLAGS"]
             [AM_LDFLAGS="-L$with_lime/lib $AM_LDFLAGS"])
+
+############### LIBUNWIND
+AC_ARG_WITH([unwind],
+            [AS_HELP_STRING([--with-unwind=prefix],
+            [try this for a non-standard install prefix of the libunwind library])],
+            [AM_CXXFLAGS="-I$with_unwind/include $AM_CXXFLAGS"]
+            [AM_LDFLAGS="-L$with_unwind/lib $AM_LDFLAGS"])
 
 ############### OpenSSL
 AC_ARG_WITH([openssl],
@@ -214,7 +222,7 @@ esac
 
 ############### Symplectic group
 AC_ARG_ENABLE([Sp],
-    [AC_HELP_STRING([--enable-Sp=yes|no], [enable gauge group Sp2n])],
+    [AS_HELP_STRING([--enable-Sp=yes|no],[enable gauge group Sp2n])],
     [ac_ENABLE_SP=${enable_Sp}], [ac_ENABLE_SP=no])
 
 AM_CONDITIONAL(BUILD_SP, [ test "${ac_ENABLE_SP}X" == "yesX" ])
@@ -252,6 +260,28 @@ AC_DEFINE([ACCELERATOR_CSHIFT],[1],[ Cshift runs on device])
 case ${ac_ACCELERATOR_AWARE_MPI} in
     yes)
       AC_DEFINE([ACCELERATOR_AWARE_MPI],[1],[ Stencil can use device pointers]);;
+    *);;
+esac
+
+############### CHECKSUM COMMS
+AC_ARG_ENABLE([checksum-comms],
+    [AS_HELP_STRING([--enable-checksum-comms=yes|no],[checksum all communication])],
+    [ac_CHECKSUM_COMMS=${enable_checksum_comms}], [ac_CHECKSUM_COMMS=yes])
+
+case ${ac_CHECKSUM_COMMS} in
+    yes)
+      AC_DEFINE([GRID_CHECKSUM_COMMS],[1],[checksum all communication]);;
+    *);;
+esac
+
+############### LOG VIEWS
+AC_ARG_ENABLE([log-views],
+    [AS_HELP_STRING([--enable-log-views=yes|no],[log information on all view open/close])],
+    [ac_LOG_VIEWS=${enable_log_views}], [ac_LOG_VIEWS=yes])
+
+case ${ac_LOG_VIEWS} in
+    yes)
+      AC_DEFINE([GRID_LOG_VIEWS],[1],[log information on all view open/close]);;
     *);;
 esac
 
@@ -372,6 +402,16 @@ AC_SEARCH_LIBS([limeCreateReader], [lime],
                [AC_DEFINE([HAVE_LIME], [1], [Define to 1 if you have the `LIME' library])]
                [have_lime=true],
 	             [AC_MSG_WARN(LIME library was not found in your system.)])
+
+AC_SEARCH_LIBS([unw_backtrace], [unwind],
+               [AC_DEFINE([HAVE_UNWIND], [1], [Define to 1 if you have the `libunwind' library])]
+               [have_unwind=true],
+	             [AC_MSG_WARN(libunwind library was not found in your system.)])
+
+AC_SEARCH_LIBS([_Ux86_64_step], [unwind-x86_64],
+               [AC_DEFINE([HAVE_UNWIND_X86_64], [1], [Define to 1 if you have the `libunwind-x86_64' library])]
+               [have_unwind_x86_64=true],
+	             [AC_MSG_WARN(libunwind library was not found in your system.)])
 
 AC_SEARCH_LIBS([SHA256_Init], [crypto],
                [AC_DEFINE([HAVE_CRYPTO], [1], [Define to 1 if you have the `OpenSSL' library])]
