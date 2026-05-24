@@ -303,7 +303,7 @@ void StaggeredKernels<Impl>::DhopImproved(StencilImpl &st,
   });
 
 template <class Impl>
-void StaggeredKernels<Impl>::DhopNaive(StencilImpl &st, LebesgueOrder &lo, 
+void StaggeredKernels<Impl>::DhopNaive(StencilImpl &st,
 				       DoubledGaugeField &U,
 				       const FermionField &in, FermionField &out, int dag, int interior,int exterior)
 {
