@@ -344,6 +344,7 @@ void StaggeredKernels<Impl>::DhopNaive(StencilImpl &st,
 #undef KERNEL_CALLNB
 #undef KERNEL_CALL
 #undef ASM_CALL
+#undef ASM_CALL_NAIVE
 
 NAMESPACE_END(Grid);
 
