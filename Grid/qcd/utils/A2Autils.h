@@ -1077,7 +1077,7 @@ void A2Autils<FImpl>::AslashField(TensorType &mat,
     if (t_gsum) *t_gsum += usecond();
 }
 
-
+#endif
 //
 // meson field with user defined v,w vecs.
 // No gammas or mom done here
@@ -1230,9 +1230,6 @@ void A2Autils<FImpl>::StagMesonField(TensorType &mat,
     grid->GlobalSumVector(&mat(0,0,0,0,0),Nmom*Ngamma*Nt*Lblock*Rblock);
     if (t_gsum) *t_gsum += usecond();
 }
-
-
-#endif
 ////////////////////////////////////////////
 // Schematic thoughts about more generalised four quark insertion
 //
