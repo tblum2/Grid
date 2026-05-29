@@ -1548,5 +1548,369 @@ void A2Autils<FImpl>::PionFieldVV(Eigen::Tensor<ComplexD,3> &mat,
 }
 */
 
+
+// ============================================================
+// GPU-accelerated extended meson field contraction.
+//
+// All kernels run via accelerator_for / coalescedRead/Write.
+// A2ASpatialSum (batched GEMM + MPI reduction) handles the
+// spatial sum; include <Grid/algorithms/blas/A2ASpatialSum.h>
+// (pulled in automatically via <Grid/Grid.h>).
+//
+// Usage:
+//   A2AExtendedMesonFieldGPU<FImpl>::compute(result,
+//       left, right, loop1, loop2, gamma1, gamma2, type);
+// ============================================================
+template <typename FImpl>
+class A2AExtendedMesonField
+{
+public:
+  typedef typename FImpl::FermionField    FermionField;
+  typedef typename FImpl::PropagatorField PropagatorField;
+  typedef typename FImpl::SiteSpinor      vobj;
+  typedef typename vobj::scalar_type      scalar_type;
+  typedef typename vobj::vector_type      vector_type;
+
+  typedef iSpinColourMatrix<vector_type> SpinColourMatrix_v;
+  typedef iSpinColourVector<vector_type> SpinColourVector_v;
+  typedef iSpinMatrix<vector_type>       SpinMatrix_v;
+
+  // ----------------------------------------------------------
+  // Kernel: loop propagator = sum_k outerProduct(loop1[k], loop2[k])
+  // ----------------------------------------------------------
+  static void LoopPropagator(PropagatorField &loop,
+                              const std::vector<FermionField> &loop1,
+                              const std::vector<FermionField> &loop2)
+  {
+    int Nk          = (int)loop1.size();
+    uint64_t oSites = loop.Grid()->oSites();
+    int Nsimd       = SpinColourVector_v::Nsimd();
+
+    typedef decltype(loop1[0].View(AcceleratorRead)) View;
+    std::vector<View> v1, v2;
+    v1.reserve(Nk); v2.reserve(Nk);
+    for (int k = 0; k < Nk; k++) {
+      v1.push_back(loop1[k].View(AcceleratorRead));
+      v2.push_back(loop2[k].View(AcceleratorRead));
+    }
+
+    deviceVector<SpinColourVector_v *> l1p(Nk), l2p(Nk);
+    for (int k = 0; k < Nk; k++) {
+      acceleratorPut(l1p[k], &v1[k][0]);
+      acceleratorPut(l2p[k], &v2[k][0]);
+    }
+
+    autoView(loopv, loop, AcceleratorWrite);
+    SpinColourVector_v **l1 = &l1p[0];
+    SpinColourVector_v **l2 = &l2p[0];
+    int lNk = Nk;
+    accelerator_for(ss, oSites, Nsimd, {
+      auto res = outerProduct(coalescedRead(l1[0][ss]), coalescedRead(l2[0][ss]));
+      for (int k = 1; k < lNk; k++)
+        res = res + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
+      coalescedWrite(loopv[ss], res);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Kernel: out = conj(in), site-local
+  // ----------------------------------------------------------
+  static void PackLeftConjugated(FermionField &out, const FermionField &in)
+  {
+    autoView(outv, out, AcceleratorWrite);
+    autoView(inv,  in,  AcceleratorRead);
+    uint64_t Osites = in.Grid()->oSites();
+    int Nsimd = SpinColourVector_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      coalescedWrite(outv[ss], conjugate(inv(ss)));
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 0 left contraction: tloop(s1,s2)(0,0) = Tr_colour[loop(s1,s2)]
+  // ----------------------------------------------------------
+  static void LoopLeftContractionType0(PropagatorField &tloop,
+                                        const PropagatorField &loop)
+  {
+    autoView(tloopv, tloop, AcceleratorWrite);
+    autoView(loopv,  loop,  AcceleratorRead);
+    uint64_t Osites = loop.Grid()->oSites();
+    int Nsimd = SpinColourMatrix_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      auto l = loopv(ss);
+      auto tmp = l; tmp = Zero();
+      for (int s1 = 0; s1 < Ns; ++s1)
+      for (int s2 = 0; s2 < Ns; ++s2)
+        tmp()(s1,s2)(0,0) = l()(s1,s2)(0,0) + l()(s1,s2)(1,1) + l()(s1,s2)(2,2);
+      coalescedWrite(tloopv[ss], tmp);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 1 left contraction: tloop = sum_mu G(g1[mu]) * loop * G(g2[mu])
+  // ----------------------------------------------------------
+  static void LoopLeftContractionType1(PropagatorField &tloop,
+                                        const PropagatorField &loop,
+                                        const Vector<Gamma::Algebra> &gamma1,
+                                        const Vector<Gamma::Algebra> &gamma2)
+  {
+    int ng = (int)gamma1.size();
+    const Gamma::Algebra *g1 = gamma1.data();
+    const Gamma::Algebra *g2 = gamma2.data();
+    autoView(tloopv, tloop, AcceleratorWrite);
+    autoView(loopv,  loop,  AcceleratorRead);
+    uint64_t Osites = loop.Grid()->oSites();
+    int Nsimd = SpinColourMatrix_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      auto l = loopv(ss);
+      auto tmp = l; tmp = Zero();
+      for (int mu = 0; mu < ng; ++mu)
+        tmp = tmp + Gamma(g1[mu]) * l * Gamma(g2[mu]);
+      coalescedWrite(tloopv[ss], tmp);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 2 left contraction:
+  //   mu = (s1*Ns + s2); tloop(s1,s2)(c1,c2) = Tr_spin[G(g2[mu])*loop](c1,c2)
+  // ----------------------------------------------------------
+  static void LoopLeftContractionType2(PropagatorField &tloop,
+                                        const PropagatorField &loop,
+                                        const Vector<Gamma::Algebra> &gamma2)
+  {
+    int ng = (int)gamma2.size();
+    const Gamma::Algebra *g2 = gamma2.data();
+    autoView(tloopv, tloop, AcceleratorWrite);
+    autoView(loopv,  loop,  AcceleratorRead);
+    uint64_t Osites = loop.Grid()->oSites();
+    int Nsimd = SpinColourMatrix_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      auto l = loopv(ss);
+      auto tmp = l; tmp = Zero();
+      for (int mu = 0; mu < ng; ++mu) {
+        auto gtmp = Gamma(g2[mu]) * l;
+        int s1 = mu / Ns;
+        int s2 = mu % Ns;
+        for (int c1 = 0; c1 < Nc; ++c1)
+        for (int c2 = 0; c2 < Nc; ++c2)
+          tmp()(s1,s2)(c1,c2) = gtmp()(0,0)(c1,c2) + gtmp()(1,1)(c1,c2)
+                              + gtmp()(2,2)(c1,c2) + gtmp()(3,3)(c1,c2);
+      }
+      coalescedWrite(tloopv[ss], tmp);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 3 left contraction:
+  //   spinLoop(s1,s2) = Tr_colour[loop(s1,s2)]
+  //   tloop(s1,s2)(0,0) = sum_mu [G(g1[mu])*spinLoop*G(g2[mu])](s1,s2)
+  // ----------------------------------------------------------
+  static void LoopLeftContractionType3(PropagatorField &tloop,
+                                        const PropagatorField &loop,
+                                        const Vector<Gamma::Algebra> &gamma1,
+                                        const Vector<Gamma::Algebra> &gamma2)
+  {
+    int ng = (int)gamma1.size();
+    const Gamma::Algebra *g1 = gamma1.data();
+    const Gamma::Algebra *g2 = gamma2.data();
+    autoView(tloopv, tloop, AcceleratorWrite);
+    autoView(loopv,  loop,  AcceleratorRead);
+    uint64_t Osites = loop.Grid()->oSites();
+    int Nsimd = SpinColourMatrix_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      typedef decltype(coalescedRead(loopv[0])) calcSCMatrix;
+      typedef iSpinMatrix<typename calcSCMatrix::vector_type> calcSpinMatrix;
+      auto l = loopv(ss);
+      calcSpinMatrix spinLoop; spinLoop = Zero();
+      for (int s1 = 0; s1 < Ns; ++s1)
+      for (int s2 = 0; s2 < Ns; ++s2)
+        spinLoop()(s1,s2)() = l()(s1,s2)(0,0) + l()(s1,s2)(1,1) + l()(s1,s2)(2,2);
+      auto tmp = l; tmp = Zero();
+      for (int mu = 0; mu < ng; ++mu) {
+        calcSpinMatrix tmp2 = Gamma(g1[mu]) * spinLoop * Gamma(g2[mu]);
+        for (int s1 = 0; s1 < Ns; ++s1)
+        for (int s2 = 0; s2 < Ns; ++s2)
+          tmp()(s1,s2)(0,0) = tmp()(s1,s2)(0,0) + tmp2()(s1,s2)();
+      }
+      coalescedWrite(tloopv[ss], tmp);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 0 right contraction:
+  //   spinLoop(s1,s2) = tloop(s1,s2)(0,0)  [already colour-traced]
+  //   loopRight += sum_mu Tr[G(g2[mu])*spinLoop] * G(g1[mu])*right
+  // ----------------------------------------------------------
+  static void LoopRightContractionType0(FermionField &loopRight,
+                                         const PropagatorField &tloop,
+                                         const FermionField &right,
+                                         const Vector<Gamma::Algebra> &gamma1,
+                                         const Vector<Gamma::Algebra> &gamma2)
+  {
+    int ng = (int)gamma1.size();
+    const Gamma::Algebra *g1 = gamma1.data();
+    const Gamma::Algebra *g2 = gamma2.data();
+    autoView(lRv, loopRight, AcceleratorWrite);
+    autoView(tlv, tloop,     AcceleratorRead);
+    autoView(rv,  right,     AcceleratorRead);
+    uint64_t Osites = right.Grid()->oSites();
+    int Nsimd = SpinColourVector_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      typedef decltype(coalescedRead(rv[0]))  calcSCVector;
+      typedef decltype(coalescedRead(tlv[0])) calcSCMatrix;
+      typedef iSpinMatrix<typename calcSCMatrix::vector_type> calcSpinMatrix;
+      auto loopm  = tlv(ss);
+      auto rightv = rv(ss);
+      calcSpinMatrix spinLoop; spinLoop = Zero();
+      for (int s1 = 0; s1 < Ns; ++s1)
+      for (int s2 = 0; s2 < Ns; ++s2)
+        spinLoop()(s1,s2)() = loopm()(s1,s2)(0,0);
+      calcSCVector lR; lR = Zero();
+      for (int mu = 0; mu < ng; ++mu) {
+        auto GLoop   = Gamma(g2[mu]) * spinLoop;
+        auto trGLoop = GLoop()(0,0)() + GLoop()(1,1)() + GLoop()(2,2)() + GLoop()(3,3)();
+        auto Grightv = Gamma(g1[mu]) * rightv;
+        for (int s = 0; s < Ns; ++s)
+        for (int c = 0; c < Nc; ++c)
+          lR()(s)(c) = lR()(s)(c) + Grightv()(s)(c) * trGLoop;
+      }
+      coalescedWrite(lRv[ss], lR);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 1 right contraction: loopRight = tloop * right
+  // ----------------------------------------------------------
+  static void LoopRightContractionType1(FermionField &loopRight,
+                                         const PropagatorField &tloop,
+                                         const FermionField &right)
+  {
+    autoView(lRv, loopRight, AcceleratorWrite);
+    autoView(tlv, tloop,     AcceleratorRead);
+    autoView(rv,  right,     AcceleratorRead);
+    uint64_t Osites = right.Grid()->oSites();
+    int Nsimd = SpinColourVector_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      coalescedWrite(lRv[ss], tlv(ss) * rv(ss));
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 2 right contraction:
+  //   mu = (s1*Ns+s2); loopRight(s)(c) += sum_{mu,c'} tloop(s1,s2)(c,c') * [G(g1[mu])*right](s)(c')
+  // ----------------------------------------------------------
+  static void LoopRightContractionType2(FermionField &loopRight,
+                                         const PropagatorField &tloop,
+                                         const FermionField &right,
+                                         const Vector<Gamma::Algebra> &gamma1)
+  {
+    int ng = (int)gamma1.size();
+    const Gamma::Algebra *g1 = gamma1.data();
+    autoView(lRv, loopRight, AcceleratorWrite);
+    autoView(tlv, tloop,     AcceleratorRead);
+    autoView(rv,  right,     AcceleratorRead);
+    uint64_t Osites = right.Grid()->oSites();
+    int Nsimd = SpinColourVector_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      typedef decltype(coalescedRead(rv[0])) calcSCVector;
+      auto loopm  = tlv(ss);
+      auto rightv = rv(ss);
+      calcSCVector lR; lR = Zero();
+      for (int mu = 0; mu < ng; ++mu) {
+        int s1 = mu / Ns;
+        int s2 = mu % Ns;
+        auto Grightv = Gamma(g1[mu]) * rightv;
+        for (int s = 0; s < Ns; ++s)
+        for (int c = 0; c < Nc; ++c)
+          lR()(s)(c) = lR()(s)(c)
+                     + loopm()(s1,s2)(c,0) * Grightv()(s)(0)
+                     + loopm()(s1,s2)(c,1) * Grightv()(s)(1)
+                     + loopm()(s1,s2)(c,2) * Grightv()(s)(2);
+      }
+      coalescedWrite(lRv[ss], lR);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Type 3 right contraction:
+  //   loopRight(s)(c) = sum_{s'} tloop(s,s')(0,0) * right(s')(c)
+  // ----------------------------------------------------------
+  static void LoopRightContractionType3(FermionField &loopRight,
+                                         const PropagatorField &tloop,
+                                         const FermionField &right)
+  {
+    autoView(lRv, loopRight, AcceleratorWrite);
+    autoView(tlv, tloop,     AcceleratorRead);
+    autoView(rv,  right,     AcceleratorRead);
+    uint64_t Osites = right.Grid()->oSites();
+    int Nsimd = SpinColourVector_v::Nsimd();
+    accelerator_for(ss, Osites, Nsimd, {
+      typedef decltype(coalescedRead(rv[0])) calcSCVector;
+      auto loopm  = tlv(ss);
+      auto rightv = rv(ss);
+      calcSCVector lR; lR = Zero();
+      for (int s = 0; s < Ns; ++s)
+      for (int c = 0; c < Nc; ++c)
+        lR()(s)(c) = loopm()(s,0)(0,0) * rightv()(0)(c)
+                   + loopm()(s,1)(0,0) * rightv()(1)(c)
+                   + loopm()(s,2)(0,0) * rightv()(2)(c)
+                   + loopm()(s,3)(0,0) * rightv()(3)(c);
+      coalescedWrite(lRv[ss], lR);
+    });
+  }
+
+  // ----------------------------------------------------------
+  // compute: GPU extended meson field for one (type, gamma pair).
+  //   leftv — pre-conjugated left vectors (from PackLeftConjugated)
+  //   loop  — pre-built loop propagator   (from LoopPropagator)
+  //   result[t][i][j] — rank-3 Eigen tensor (nt x N_i x N_j)
+  // ----------------------------------------------------------
+  template <typename TensorType>
+  static void compute(
+      TensorType &result,
+      const std::vector<FermionField> &leftv,
+      const std::vector<FermionField> &right,
+      const PropagatorField &loop,
+      const std::vector<Gamma::Algebra> &gamma1_in,
+      const std::vector<Gamma::Algebra> &gamma2_in,
+      int type)
+  {
+    GridBase *grid = loop.Grid();
+    int N_i = (int)leftv.size();
+    int N_j = (int)right.size();
+
+    // Copy gamma arrays into UVM-accessible Vector so kernels can read on device.
+    Vector<Gamma::Algebra> gamma1(gamma1_in.begin(), gamma1_in.end());
+    Vector<Gamma::Algebra> gamma2(gamma2_in.begin(), gamma2_in.end());
+
+    PropagatorField tloop(grid);
+    tloop = Zero();
+    switch (type) {
+    case 0: LoopLeftContractionType0(tloop, loop);                 break;
+    case 1: LoopLeftContractionType1(tloop, loop, gamma1, gamma2); break;
+    case 2: LoopLeftContractionType2(tloop, loop, gamma2);         break;
+    case 3: LoopLeftContractionType3(tloop, loop, gamma1, gamma2); break;
+    default: assert(0 && "A2AExtendedMesonFieldGPU: unknown contraction type"); break;
+    }
+
+    std::vector<FermionField> loopRight(N_j, grid);
+    for (int j = 0; j < N_j; j++) {
+      switch (type) {
+      case 0: LoopRightContractionType0(loopRight[j], tloop, right[j], gamma1, gamma2); break;
+      case 1: LoopRightContractionType1(loopRight[j], tloop, right[j]);                 break;
+      case 2: LoopRightContractionType2(loopRight[j], tloop, right[j], gamma1);         break;
+      case 3: LoopRightContractionType3(loopRight[j], tloop, right[j]);                 break;
+      default: assert(0 && "A2AExtendedMesonFieldGPU: unknown contraction type"); break;
+      }
+    }
+
+    A2ASpatialSum<SpinColourVector_v> spatial_sum;
+    spatial_sum.Allocate(N_i, N_j, grid);
+    spatial_sum.PackLeft(leftv);
+    spatial_sum.PackRight(loopRight);
+    spatial_sum.Sum(result);
+  }
+};
+
 NAMESPACE_END(Grid);
 

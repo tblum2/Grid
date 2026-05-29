@@ -779,6 +779,9 @@ int main(int argc, char *argv[])
   Eigen::Tensor<ComplexD, 3> result_gpu(Nt, N_i, N_j);
   double t_ref = 0, t_blas = 0, t_gpu = 0, start, stop;
 
+  // Force GPU initialisation before any timed section to avoid corrupted type=0 timers.
+  { int dummy = 0; accelerator_for(i, 1, 1, { (void)i; }); }
+
   for (int type = 0; type < 4; type++) {
 
     result_ref.setZero();

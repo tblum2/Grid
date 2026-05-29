@@ -102,21 +102,25 @@ public:
     }
   }
 
-  void PackLeft(const std::vector<Lattice<vobj>> &leftv)
+  void PackLeft(const std::vector<Lattice<vobj>> &leftv, int start = 0, int count = -1)
   {
-    GRID_ASSERT((int)leftv.size() == N_i);
-    PackVectors(leftv, &W_buf[0], N_i);
+    if (count < 0) count = (int)leftv.size();
+    GRID_ASSERT(start + count <= (int)leftv.size());
+    GRID_ASSERT(count == N_i);
+    PackVectors(leftv, &W_buf[0], N_i, start);
   }
 
-  void PackRight(const std::vector<Lattice<vobj>> &loopRight)
+  void PackRight(const std::vector<Lattice<vobj>> &loopRight, int start = 0, int count = -1)
   {
-    GRID_ASSERT((int)loopRight.size() == N_j);
-    PackVectors(loopRight, &LR_buf[0], N_j);
+    if (count < 0) count = (int)loopRight.size();
+    GRID_ASSERT(start + count <= (int)loopRight.size());
+    GRID_ASSERT(count == N_j);
+    PackVectors(loopRight, &LR_buf[0], N_j, start);
   }
 
-private:
-  // Pack vecs[N] lattice fields into buf[nt][N][nxyz*Nsc], extracting all SIMD lanes.
-  void PackVectors(const std::vector<Lattice<vobj>> &vecs, scalar *buf, int N)
+public:
+  // Pack vecs[start..start+N-1] lattice fields into buf[nt][N][nxyz*Nsc], extracting all SIMD lanes.
+  void PackVectors(const std::vector<Lattice<vobj>> &vecs, scalar *buf, int N, int start = 0)
   {
     int nd     = grid->_ndimension;
     int osites = grid->oSites();
@@ -129,7 +133,7 @@ private:
     Coordinate simd        = grid->_simd_layout;
 
     for (int n = 0; n < N; n++) {
-      autoView(src_v, vecs[n], AcceleratorRead);
+      autoView(src_v, vecs[start + n], AcceleratorRead);
       accelerator_for(sf, osites, Nsimd, {
 #ifdef GRID_SIMT
         {
