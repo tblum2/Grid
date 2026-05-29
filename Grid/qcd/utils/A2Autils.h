@@ -1610,6 +1610,10 @@ public:
         res = res + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
       coalescedWrite(loopv[ss], res);
     });
+    for (int k = 0; k < Nk; k++) {
+      v1[k].ViewClose();
+      v2[k].ViewClose();
+    }
   }
 
   // ----------------------------------------------------------
@@ -1627,9 +1631,9 @@ public:
   }
 
   // ----------------------------------------------------------
-  // Type 0 left contraction: tloop(s1,s2)(0,0) = Tr_colour[loop(s1,s2)]
+  // Type 0 loop contraction: tloop(s1,s2)(0,0) = Tr_colour[loop(s1,s2)]
   // ----------------------------------------------------------
-  static void LoopLeftContractionType0(PropagatorField &tloop,
+  static void LoopContractionType0(PropagatorField &tloop,
                                         const PropagatorField &loop)
   {
     autoView(tloopv, tloop, AcceleratorWrite);
@@ -1647,9 +1651,9 @@ public:
   }
 
   // ----------------------------------------------------------
-  // Type 1 left contraction: tloop = sum_mu G(g1[mu]) * loop * G(g2[mu])
+  // Type 1 loop contraction: tloop = sum_mu G(g1[mu]) * loop * G(g2[mu])
   // ----------------------------------------------------------
-  static void LoopLeftContractionType1(PropagatorField &tloop,
+  static void LoopContractionType1(PropagatorField &tloop,
                                         const PropagatorField &loop,
                                         const Vector<Gamma::Algebra> &gamma1,
                                         const Vector<Gamma::Algebra> &gamma2)
@@ -1671,10 +1675,10 @@ public:
   }
 
   // ----------------------------------------------------------
-  // Type 2 left contraction:
+  // Type 2 loop contraction:
   //   mu = (s1*Ns + s2); tloop(s1,s2)(c1,c2) = Tr_spin[G(g2[mu])*loop](c1,c2)
   // ----------------------------------------------------------
-  static void LoopLeftContractionType2(PropagatorField &tloop,
+  static void LoopContractionType2(PropagatorField &tloop,
                                         const PropagatorField &loop,
                                         const Vector<Gamma::Algebra> &gamma2)
   {
@@ -1701,11 +1705,11 @@ public:
   }
 
   // ----------------------------------------------------------
-  // Type 3 left contraction:
+  // Type 3 loop contraction:
   //   spinLoop(s1,s2) = Tr_colour[loop(s1,s2)]
   //   tloop(s1,s2)(0,0) = sum_mu [G(g1[mu])*spinLoop*G(g2[mu])](s1,s2)
   // ----------------------------------------------------------
-  static void LoopLeftContractionType3(PropagatorField &tloop,
+  static void LoopContractionType3(PropagatorField &tloop,
                                         const PropagatorField &loop,
                                         const Vector<Gamma::Algebra> &gamma1,
                                         const Vector<Gamma::Algebra> &gamma2)
@@ -1886,10 +1890,10 @@ public:
     PropagatorField tloop(grid);
     tloop = Zero();
     switch (type) {
-    case 0: LoopLeftContractionType0(tloop, loop);                 break;
-    case 1: LoopLeftContractionType1(tloop, loop, gamma1, gamma2); break;
-    case 2: LoopLeftContractionType2(tloop, loop, gamma2);         break;
-    case 3: LoopLeftContractionType3(tloop, loop, gamma1, gamma2); break;
+    case 0: LoopContractionType0(tloop, loop);                 break;
+    case 1: LoopContractionType1(tloop, loop, gamma1, gamma2); break;
+    case 2: LoopContractionType2(tloop, loop, gamma2);         break;
+    case 3: LoopContractionType3(tloop, loop, gamma1, gamma2); break;
     default: assert(0 && "A2AExtendedMesonFieldGPU: unknown contraction type"); break;
     }
 
