@@ -415,6 +415,10 @@ void A2ALoopPropagator(PropagatorField &loop,
       result = result + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
     coalescedWrite(loopv[ss], result);
   });
+  for (int k = 0; k < Nk; k++) {
+    v1[k].ViewClose();
+    v2[k].ViewClose();
+  }
 }
 
 void A2APackLeftConjugated(FermionField &out, const FermionField &in)
