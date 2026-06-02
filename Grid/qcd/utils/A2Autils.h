@@ -1619,7 +1619,7 @@ public:
   // ----------------------------------------------------------
   // Kernel: out = conj(in), site-local
   // ----------------------------------------------------------
-  static void PackLeftConjugated(FermionField &out, const FermionField &in)
+  [[maybe_unused]] static void PackLeftConjugated(FermionField &out, const FermionField &in)
   {
     autoView(outv, out, AcceleratorWrite);
     autoView(inv,  in,  AcceleratorRead);
@@ -1865,14 +1865,14 @@ public:
 
   // ----------------------------------------------------------
   // compute: GPU extended meson field for one (type, gamma pair).
-  //   leftv — pre-conjugated left vectors (from PackLeftConjugated)
-  //   loop  — pre-built loop propagator   (from LoopPropagator)
+  //   left   — original left vectors (conjugated during packing)
+  //   loop   — pre-built loop propagator (from LoopPropagator)
   //   result[t][i][j] — rank-3 Eigen tensor (nt x N_i x N_j)
   // ----------------------------------------------------------
   template <typename TensorType>
   static void compute(
       TensorType &result,
-      const std::vector<FermionField> &leftv,
+      const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const PropagatorField &loop,
       const std::vector<Gamma::Algebra> &gamma1_in,
@@ -1880,7 +1880,7 @@ public:
       int type)
   {
     GridBase *grid = loop.Grid();
-    int N_i = (int)leftv.size();
+    int N_i = (int)left.size();
     int N_j = (int)right.size();
 
     // Copy gamma arrays into UVM-accessible Vector so kernels can read on device.
@@ -1910,7 +1910,7 @@ public:
 
     A2ASpatialSum<SpinColourVector_v> spatial_sum;
     spatial_sum.Allocate(N_i, N_j, grid);
-    spatial_sum.PackLeft(leftv);
+    spatial_sum.PackLeftConj(left);
     spatial_sum.PackRight(loopRight);
     spatial_sum.Sum(result);
   }

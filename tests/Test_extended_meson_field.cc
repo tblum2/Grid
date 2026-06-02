@@ -421,7 +421,7 @@ void A2ALoopPropagator(PropagatorField &loop,
   }
 }
 
-void A2APackLeftConjugated(FermionField &out, const FermionField &in)
+[[maybe_unused]] void A2APackLeftConjugated(FermionField &out, const FermionField &in)
 {
   autoView(outv, out, AcceleratorWrite);
   autoView(inv,  in,  AcceleratorRead);
@@ -679,16 +679,6 @@ public:
     std::cout << GridLogMessage << tag << " loop_build:      " << Tms(usecond()-t0) << " ms\n";
 
     t0 = usecond();
-    for (int i = 0; i < N_i; i++) { autoView(v, left[i], AcceleratorRead); }
-    std::cout << GridLogMessage << tag << " view_open_left:  " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    std::vector<FermionField> leftv(N_i, grid);
-    for (int i = 0; i < N_i; i++)
-      A2APackLeftConjugated(leftv[i], left[i]);
-    std::cout << GridLogMessage << tag << " pack_left:       " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
     PropagatorField tloop(grid);
     tloop = Zero();
     switch (type) {
@@ -724,8 +714,8 @@ public:
     std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
 
     t0 = usecond();
-    spatial_sum.PackLeft(leftv);
-    std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
+    spatial_sum.PackLeftConj(left);
+    std::cout << GridLogMessage << tag << " PackLeftConj:    " << Tms(usecond()-t0) << " ms\n";
 
     t0 = usecond();
     spatial_sum.PackRight(loopRight);
