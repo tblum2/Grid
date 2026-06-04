@@ -1617,20 +1617,6 @@ public:
   }
 
   // ----------------------------------------------------------
-  // Kernel: out = conj(in), site-local
-  // ----------------------------------------------------------
-  [[maybe_unused]] static void PackLeftConjugated(FermionField &out, const FermionField &in)
-  {
-    autoView(outv, out, AcceleratorWrite);
-    autoView(inv,  in,  AcceleratorRead);
-    uint64_t Osites = in.Grid()->oSites();
-    int Nsimd = SpinColourVector_v::Nsimd();
-    accelerator_for(ss, Osites, Nsimd, {
-      coalescedWrite(outv[ss], conjugate(inv(ss)));
-    });
-  }
-
-  // ----------------------------------------------------------
   // Type 0 loop contraction: tloop(s1,s2)(0,0) = Tr_colour[loop(s1,s2)]
   // ----------------------------------------------------------
   static void LoopContractionType0(PropagatorField &tloop,

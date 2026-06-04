@@ -73,76 +73,34 @@ public:
 
   A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0) {}
 
-  // void Allocate(int _N_i, int _N_j, GridBase *_grid)
-  // {
-  //   grid = _grid;
-  //   N_i  = _N_i;
-  //   N_j  = _N_j;
-  //   Coordinate ldims = grid->LocalDimensions();
-  //   nt   = ldims[grid->Nd() - 1];
-  //   nxyz = grid->lSites() / nt;
-  //   Nsc  = sizeof(sobj) / sizeof(scalar);
-  //
-  //   W_buf.resize(nt * N_i * nxyz * Nsc);
-  //   LR_buf.resize(nt * N_j * nxyz * Nsc);
-  //   EMF_buf.resize(nt * N_j * N_i);
-  //
-  //   // Build persistent batch pointer arrays
-  //   W_ptrs.resize(nt);
-  //   LR_ptrs.resize(nt);
-  //   EMF_ptrs.resize(nt);
-  //   scalar *Wh   = &W_buf[0];
-  //   scalar *LRh  = &LR_buf[0];
-  //   scalar *EMFh = &EMF_buf[0];
-  //   int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-  //   for (int t = 0; t < nt; t++) {
-  //     acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
-  //     acceleratorPut(LR_ptrs[t],  LRh  + t * lN_j * lnxyz * lNsc);
-  //     acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
-  //   }
-  // }
-
-  void Allocate(int _N_i, int _N_j, GridBase *_grid)
-  {
-    AllocateRight(_N_j, _grid);
-    AllocateLeft(_N_i);
-  }
-
-  // Call once per j-block, before the i-loop. Sets grid, N_j, nt, nxyz, Nsc.
-  void AllocateRight(int _N_j, GridBase *_grid)
-  {
-    grid = _grid;
-    N_j  = _N_j;
-    Coordinate ldims = grid->LocalDimensions();
-    nt   = ldims[grid->Nd() - 1];
-    nxyz = grid->lSites() / nt;
-    Nsc  = sizeof(sobj) / sizeof(scalar);
-
-    LR_buf.resize(nt * N_j * nxyz * Nsc);
-    LR_ptrs.resize(nt);
-    scalar *LRh = &LR_buf[0];
-    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-    for (int t = 0; t < nt; t++)
-      acceleratorPut(LR_ptrs[t], LRh + t * lN_j * lnxyz * lNsc);
-  }
-
-  // Call once per i-block, inside the i-loop. Must follow AllocateRight. Sets N_i.
-  void AllocateLeft(int _N_i)
-  {
-    N_i = _N_i;
-
-    W_buf.resize(nt * N_i * nxyz * Nsc);
-    EMF_buf.resize(nt * N_j * N_i);
-    W_ptrs.resize(nt);
-    EMF_ptrs.resize(nt);
-    scalar *Wh   = &W_buf[0];
-    scalar *EMFh = &EMF_buf[0];
-    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-    for (int t = 0; t < nt; t++) {
-      acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
-      acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
-    }
-  }
+   void Allocate(int _N_i, int _N_j, GridBase *_grid)
+   {
+     grid = _grid;
+     N_i  = _N_i;
+     N_j  = _N_j;
+     Coordinate ldims = grid->LocalDimensions();
+     nt   = ldims[grid->Nd() - 1];
+     nxyz = grid->lSites() / nt;
+     Nsc  = sizeof(sobj) / sizeof(scalar);
+  
+     W_buf.resize(nt * N_i * nxyz * Nsc);
+     LR_buf.resize(nt * N_j * nxyz * Nsc);
+     EMF_buf.resize(nt * N_j * N_i);
+  
+     // Build persistent batch pointer arrays
+     W_ptrs.resize(nt);
+     LR_ptrs.resize(nt);
+     EMF_ptrs.resize(nt);
+     scalar *Wh   = &W_buf[0];
+     scalar *LRh  = &LR_buf[0];
+     scalar *EMFh = &EMF_buf[0];
+     int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
+     for (int t = 0; t < nt; t++) {
+       acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
+       acceleratorPut(LR_ptrs[t],  LRh  + t * lN_j * lnxyz * lNsc);
+       acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
+     }
+   }
 
   void PackLeft(const std::vector<Lattice<vobj>> &leftv, int start = 0, int count = -1)
   {
