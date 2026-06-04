@@ -421,19 +421,8 @@ void A2ALoopPropagator(PropagatorField &loop,
   }
 }
 
-[[maybe_unused]] void A2APackLeftConjugated(FermionField &out, const FermionField &in)
-{
-  autoView(outv, out, AcceleratorWrite);
-  autoView(inv,  in,  AcceleratorRead);
-  uint64_t Osites = in.Grid()->oSites();
-  int Nsimd = SpinColourVector_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    coalescedWrite(outv[ss], conjugate(inv(ss)));
-  });
-}
-
 // Type 0: colour-trace stored in (s1,s2)(0,0)
-void A2ALoopLeftContractionType0(PropagatorField &tloop, const PropagatorField &loop)
+void A2ALoopContractionType0(PropagatorField &tloop, const PropagatorField &loop)
 {
   autoView(tloopv, tloop, AcceleratorWrite);
   autoView(loopv,  loop,  AcceleratorRead);
@@ -450,7 +439,7 @@ void A2ALoopLeftContractionType0(PropagatorField &tloop, const PropagatorField &
 }
 
 // Type 1: tloop = sum_mu Gamma(g1[mu]) * loop * Gamma(g2[mu])
-void A2ALoopLeftContractionType1(PropagatorField &tloop, const PropagatorField &loop,
+void A2ALoopContractionType1(PropagatorField &tloop, const PropagatorField &loop,
                                   const Vector<Gamma::Algebra> &gamma1,
                                   const Vector<Gamma::Algebra> &gamma2)
 {
@@ -472,7 +461,7 @@ void A2ALoopLeftContractionType1(PropagatorField &tloop, const PropagatorField &
 
 // Type 2: for mu=[0..ng), s1=mu/Ns, s2=mu%Ns;
 //         tloop(s1,s2)(c1,c2) = Tr_spin( Gamma(g2[mu]) * loop )(c1,c2)
-void A2ALoopLeftContractionType2(PropagatorField &tloop, const PropagatorField &loop,
+void A2ALoopContractionType2(PropagatorField &tloop, const PropagatorField &loop,
                                   const Vector<Gamma::Algebra> &gamma2)
 {
   int ng = (int)gamma2.size();
@@ -498,7 +487,7 @@ void A2ALoopLeftContractionType2(PropagatorField &tloop, const PropagatorField &
 }
 
 // Type 3: colour-trace → spin matrix → sum_mu G1*spinLoop*G2 stored in (s1,s2)(0,0)
-void A2ALoopLeftContractionType3(PropagatorField &tloop, const PropagatorField &loop,
+void A2ALoopContractionType3(PropagatorField &tloop, const PropagatorField &loop,
                                   const Vector<Gamma::Algebra> &gamma1,
                                   const Vector<Gamma::Algebra> &gamma2)
 {
@@ -682,10 +671,10 @@ public:
     PropagatorField tloop(grid);
     tloop = Zero();
     switch (type) {
-    case 0: A2ALoopLeftContractionType0(tloop, loop);                break;
-    case 1: A2ALoopLeftContractionType1(tloop, loop, gamma1, gamma2); break;
-    case 2: A2ALoopLeftContractionType2(tloop, loop, gamma2);         break;
-    case 3: A2ALoopLeftContractionType3(tloop, loop, gamma1, gamma2); break;
+    case 0: A2ALoopContractionType0(tloop, loop);                break;
+    case 1: A2ALoopContractionType1(tloop, loop, gamma1, gamma2); break;
+    case 2: A2ALoopContractionType2(tloop, loop, gamma2);         break;
+    case 3: A2ALoopContractionType3(tloop, loop, gamma1, gamma2); break;
     }
     std::cout << GridLogMessage << tag << " tloop:           " << Tms(usecond()-t0) << " ms\n";
 
