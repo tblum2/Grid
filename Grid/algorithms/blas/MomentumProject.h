@@ -95,9 +95,8 @@ public:
 
     uint64_t sz = BLAS_M.size();
 
-    GRID_ASSERT(momenta.size()==nmom)
     GRID_ASSERT(momenta[0].Grid()==grid);
-    GRID_ASSERT(sz = nxyz * nmom);
+    GRID_ASSERT(sz == nxyz * nmom);
     
     Coordinate rdimensions = grid->_rdimensions;
     Coordinate ldims       = grid->LocalDimensions();
