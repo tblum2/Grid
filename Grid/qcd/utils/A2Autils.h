@@ -225,14 +225,14 @@ void A2Autils<FImpl>::MesonField(TensorType &mat,
 	accelerator_for(ss,grid->oSites(),(size_t)Nsimd,{
 	    auto left = conjugate(lhs_v(ss));
 	    auto right = rhs_v(ss);
-	    auto vv =  SpinMat_v(ss);
+	    decltype(coalescedRead(SpinMat_v[ss])(jj)) spinmat;
 	    for(int s1=0;s1<Ns;s1++){
 	      for(int s2=0;s2<Ns;s2++){
-		vv(jj)(s1,s2)() = left()(s2)(0) * right()(s1)(0)
-		  +               left()(s2)(1) * right()(s1)(1)
-		  +               left()(s2)(2) * right()(s1)(2);
+		spinmat(s1,s2)() = left()(s2)(0) * right()(s1)(0)
+		  +                left()(s2)(1) * right()(s1)(1)
+		  +                left()(s2)(2) * right()(s1)(2);
 	      }}
-	    coalescedWrite(SpinMat_v[ss],vv);
+	    coalescedWrite(SpinMat_v[ss](jj),spinmat);
 	  });
 	t_kernel += usecond();
 
