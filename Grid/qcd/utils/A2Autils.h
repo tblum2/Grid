@@ -225,7 +225,7 @@ void A2Autils<FImpl>::MesonField(TensorType &mat,
 	accelerator_for(ss,grid->oSites(),(size_t)Nsimd,{
 	    auto left = conjugate(lhs_v(ss));
 	    auto right = rhs_v(ss);
-	    decltype(coalescedRead(SpinMat_v[ss])(jj)) spinmat;
+	    std::remove_reference_t<decltype(coalescedRead(SpinMat_v[ss])(jj))> spinmat;
 	    for(int s1=0;s1<Ns;s1++){
 	      for(int s2=0;s2<Ns;s2++){
 		spinmat(s1,s2)() = left()(s2)(0) * right()(s1)(0)
@@ -1893,6 +1893,180 @@ public:
       default: assert(0 && "A2AExtendedMesonFieldGPU: unknown contraction type"); break;
       }
     }
+
+    A2ASpatialSum<SpinColourVector_v> spatial_sum;
+    spatial_sum.Allocate(N_i, N_j, grid);
+    spatial_sum.PackLeftConj(left);
+    spatial_sum.PackRight(loopRight);
+    spatial_sum.Sum(result);
+  }
+};
+
+// ============================================================
+// GPU-accelerated chromo-magnetic operator field contraction.
+//
+// G[munu] (colour space, LatticeColourMatrix) and Sigma[munu]
+// (spin space, Gamma::Algebra) are kept separate throughout,
+// avoiding a PropagatorField intermediate. CMOContractRight
+// accumulates the full sum_munu G*Sigma operator into each
+// modified right vector via accelerator_for; A2ASpatialSum
+// (batched GEMM + MPI reduction) then handles the spatial sum.
+//
+// Usage (no blocking):
+//   A2AChromoMagneticOperator<GImpl,FImpl>::compute(result,
+//       left, right, U, ifOrthog, parity);
+// ============================================================
+template <typename GImpl, typename FImpl>
+class A2AChromoMagneticOperator
+{
+public:
+  typedef typename GImpl::GaugeLinkField GaugeMat;
+  typedef typename GImpl::GaugeField     GaugeField;
+  typedef typename FImpl::FermionField   FermionField;
+  typedef typename FImpl::SiteSpinor     vobj;
+  typedef typename vobj::scalar_type     scalar_type;
+  typedef typename vobj::vector_type     vector_type;
+
+  typedef iSpinColourVector<vector_type> SpinColourVector_v;
+  typedef iColourMatrix<vector_type>     ColourMatrix_v;
+
+  // ----------------------------------------------------------
+  // ifOrthog=0: spatial-temporal pairs (x,t),(y,t),(z,t)
+  //             → G[0..2] anti-Hermitian, Sigma = SigmaXT,SigmaYT,SigmaZT
+  // ----------------------------------------------------------
+  static void CMOContraction0(std::vector<GaugeMat> &G,
+                               Vector<Gamma::Algebra> &Sigma,
+                               const GaugeField &U)
+  {
+    static const int            mus[3]  = {0, 1, 2};
+    static const int            nus[3]  = {3, 3, 3};
+    static const Gamma::Algebra sigs[3] = {
+      Gamma::Algebra::SigmaXT,
+      Gamma::Algebra::SigmaYT,
+      Gamma::Algebra::SigmaZT
+    };
+    G.clear(); G.reserve(3);
+    Sigma.resize(3);
+    for (int idx = 0; idx < 3; ++idx) {
+      GaugeMat Umu(U.Grid()), Unu(U.Grid()), Gmunu(U.Grid());
+      Umu = peekLorentz(U, mus[idx]);
+      Unu = peekLorentz(U, nus[idx]);
+      WilsonLoops<GImpl>::CloverleafMxN(Gmunu, Umu, Unu, mus[idx], nus[idx], 1, 1);
+      G.push_back(Gmunu - adj(Gmunu));
+      Sigma[idx] = sigs[idx];
+    }
+  }
+
+  // ----------------------------------------------------------
+  // ifOrthog=1: spatial-spatial pairs (x,y),(x,z),(y,z)
+  //             → G[0..2] anti-Hermitian, Sigma = SigmaXY,SigmaXZ,SigmaYZ
+  // ----------------------------------------------------------
+  static void CMOContraction1(std::vector<GaugeMat> &G,
+                               Vector<Gamma::Algebra> &Sigma,
+                               const GaugeField &U)
+  {
+    static const int            mus[3]  = {0, 0, 1};
+    static const int            nus[3]  = {1, 2, 2};
+    static const Gamma::Algebra sigs[3] = {
+      Gamma::Algebra::SigmaXY,
+      Gamma::Algebra::SigmaXZ,
+      Gamma::Algebra::SigmaYZ
+    };
+    G.clear(); G.reserve(3);
+    Sigma.resize(3);
+    for (int idx = 0; idx < 3; ++idx) {
+      GaugeMat Umu(U.Grid()), Unu(U.Grid()), Gmunu(U.Grid());
+      Umu = peekLorentz(U, mus[idx]);
+      Unu = peekLorentz(U, nus[idx]);
+      WilsonLoops<GImpl>::CloverleafMxN(Gmunu, Umu, Unu, mus[idx], nus[idx], 1, 1);
+      G.push_back(Gmunu - adj(Gmunu));
+      Sigma[idx] = sigs[idx];
+    }
+  }
+
+  // ----------------------------------------------------------
+  // GPU kernel: for each right vector accumulate
+  //   loopRight(x) = sum_munu G[munu](x)*(parity?G5:1)*Gamma(Sigma[munu])*right(x)
+  // G (colour) and Sigma (spin) are kept separate; all temporaries
+  // are per-thread register SpinColourVectors — no PropagatorField.
+  // ----------------------------------------------------------
+  static void CMOContractRight(FermionField &loopRight,
+                                const std::vector<GaugeMat> &G,
+                                const Vector<Gamma::Algebra> &Sigma,
+                                const FermionField &right,
+                                int parity)
+  {
+    int ng = (int)G.size();
+
+    typedef decltype(G[0].View(AcceleratorRead)) GView;
+    std::vector<GView> gviews;
+    gviews.reserve(ng);
+    for (int munu = 0; munu < ng; ++munu)
+      gviews.push_back(G[munu].View(AcceleratorRead));
+
+    deviceVector<ColourMatrix_v *> gptrs(ng);
+    for (int munu = 0; munu < ng; ++munu)
+      acceleratorPut(gptrs[munu], &gviews[munu][0]);
+
+    autoView(lRv, loopRight, AcceleratorWrite);
+    autoView(rv,  right,     AcceleratorRead);
+
+    const Gamma::Algebra *SigmaPtr = Sigma.data();
+    ColourMatrix_v      **Gptr     = &gptrs[0];
+    int lNg     = ng;
+    int lParity = parity;
+
+    uint64_t oSites = right.Grid()->oSites();
+    int      Nsimd  = SpinColourVector_v::Nsimd();
+
+    accelerator_for(ss, oSites, Nsimd, {
+      typedef decltype(coalescedRead(rv[0])) calcSCVector;
+      auto rightv = rv(ss);
+      calcSCVector lR; lR = Zero();
+      for (int munu = 0; munu < lNg; ++munu) {
+        auto tmp2  = Gamma(SigmaPtr[munu]) * rightv;
+        if (lParity == 1) tmp2 = Gamma(Gamma::Algebra::Gamma5) * tmp2;
+        auto Gmunu = coalescedRead(Gptr[munu][ss]);
+        for (int s = 0; s < Ns; ++s)
+        for (int c = 0; c < Nc; ++c)
+          lR()(s)(c) = lR()(s)(c)
+                     + Gmunu()()(c,0) * tmp2()(s)(0)
+                     + Gmunu()()(c,1) * tmp2()(s)(1)
+                     + Gmunu()()(c,2) * tmp2()(s)(2);
+      }
+      coalescedWrite(lRv[ss], lR);
+    });
+
+    for (int munu = 0; munu < ng; ++munu)
+      gviews[munu].ViewClose();
+  }
+
+  // ----------------------------------------------------------
+  // compute: GPU CMO field for one (ifOrthog, parity) pair.
+  //   No blocking — processes all N_i x N_j vectors at once.
+  //   result[t][i][j] — rank-3 Eigen tensor (nt x N_i x N_j)
+  // ----------------------------------------------------------
+  template <typename TensorType>
+  static void compute(
+      TensorType &result,
+      const std::vector<FermionField> &left,
+      const std::vector<FermionField> &right,
+      const GaugeField &U,
+      int ifOrthog,
+      int parity)
+  {
+    GridBase *grid = left[0].Grid();
+    int N_i = (int)left.size();
+    int N_j = (int)right.size();
+
+    std::vector<GaugeMat>  G;
+    Vector<Gamma::Algebra> Sigma;
+    if (ifOrthog == 0) CMOContraction0(G, Sigma, U);
+    else               CMOContraction1(G, Sigma, U);
+
+    std::vector<FermionField> loopRight(N_j, grid);
+    for (int j = 0; j < N_j; j++)
+      CMOContractRight(loopRight[j], G, Sigma, right[j], parity);
 
     A2ASpatialSum<SpinColourVector_v> spatial_sum;
     spatial_sum.Allocate(N_i, N_j, grid);
