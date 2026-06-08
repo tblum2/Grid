@@ -163,7 +163,6 @@ public:
           xyz_coor[nd - 1] = 0;
           int64_t l_xyz;
           Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
-          l_xyz /= ldims[nd - 1]; // IndexFromCoor with t=0 gives lt*(3D spatial index); divide out lt
 
           sobj    data   = extractLane(lane, src_v[sf]);
           if constexpr (DoConj) data = conjugate(data);

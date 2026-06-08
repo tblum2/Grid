@@ -1,6 +1,8 @@
 #pragma once
 //#include <Grid/Hadrons/Global.hpp>
 #include <Grid/Grid_Eigen_Tensor.h>
+#include <Grid/qcd/action/gauge/GaugeImplementations.h>
+#include <Grid/qcd/utils/WilsonLoops.h>
 
 NAMESPACE_BEGIN(Grid);
 
