@@ -115,22 +115,6 @@ public:
     return CUBLAS_COMPUTE_32F_FAST_16F;
   }
 #endif
-  static void Finalize(void)
-  {
-    if ( gridblasInit ) {
-#ifdef GRID_CUDA
-      cublasDestroy(gridblasHandle);
-#endif
-#ifdef GRID_HIP
-      hipblasDestroy(gridblasHandle);
-#endif
-#ifdef GRID_ONE_MKL
-      delete gridblasHandle;
-#endif
-      gridblasInit = 0;
-    }
-  }
-
   // Force construct once
   GridBLAS() { Init(); };
   ~GridBLAS() { };

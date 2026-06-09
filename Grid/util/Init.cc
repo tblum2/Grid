@@ -657,11 +657,6 @@ void Grid_finalize(void)
   std::cout<<GridLogMessage<<"******* Grid Finalize                ******"<<std::endl;
   std::cout<<GridLogMessage<<"*******************************************"<<std::endl;
 
-  // Destroy the cuBLAS/hipBLAS handle before MPI_Finalize so that the GPU-aware
-  // MPI teardown (which may invalidate the CUDA context on Cray MPICH) does not
-  // cause the BLAS library's own atexit cleanup to fire against a dead context.
-  GridBLAS::Finalize();
-
 #if defined (GRID_COMMS_MPI) || defined (GRID_COMMS_MPI3) || defined (GRID_COMMS_MPIT)
   MPI_Barrier(MPI_COMM_WORLD);
   MPI_Finalize();
