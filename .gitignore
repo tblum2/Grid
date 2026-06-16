@@ -77,6 +77,7 @@ ltmain.sh
 *.log
 *.sql
 *.sqlite
+log.*
  
 # OS generated files #
 ######################
@@ -92,6 +93,7 @@ Thumbs.db
 # build directory #
 ###################
 build*/*
+install*/*
 Documentation/_build
 
 # IDE related files #

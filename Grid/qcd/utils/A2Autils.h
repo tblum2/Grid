@@ -58,37 +58,47 @@ public:
 
   
   // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
-  template <typename TensorType> 
-  static void MesonField(TensorType &mat, 
-			 const FermionField *lhs_wi,
-			 const FermionField *rhs_vj,
-			 std::vector<Gamma::Algebra> gammas,
-			 const std::vector<ComplexField > &mom,
-			 int orthogdim);
   template <typename TensorType>
   static void MesonField(TensorType &mat,
 			 const FermionField *lhs_wi,
 			 const FermionField *rhs_vj,
 			 std::vector<Gamma::Algebra> gammas,
 			 const std::vector<ComplexField > &mom,
-			 int orthogdim,double *timer)
+			 int orthogdim,
+			 int a2aBlock = A2Ablocking);
+  template <typename TensorType>
+  static void MesonField(TensorType &mat,
+			 const FermionField *lhs_wi,
+			 const FermionField *rhs_vj,
+			 std::vector<Gamma::Algebra> gammas,
+			 const std::vector<ComplexField > &mom,
+			 int orthogdim, double *timer,
+			 int a2aBlock = A2Ablocking)
   {
-    MesonField(mat,lhs_wi,rhs_vj,gammas,mom,orthogdim);
+    MesonField(mat, lhs_wi, rhs_vj, gammas, mom, orthogdim, a2aBlock);
   }
 
   // Zero-momentum meson field via batched GEMM (no MomentumProject).
-  // Applies Gamma(gamma) to rhs_vj[rhs_start..rhs_start+rhs_count-1] on GPU,
-  // then uses A2ASpatialSum to compute mat[t,i,j] = sum_x w_i^*(x,t) [G v_j](x,t).
   // mat must have shape [Nt_global, lhs_count, rhs_count].
+  // Internally blocks rhs in groups of a2aBlock, applying gamma once per j-block
+  // and reusing across all i-blocks; then calls A2ASpatialSum per (i-block, j-block).
   static void ZeroMesonField(Eigen::Tensor<ComplexD, 3> &mat,
 			     const std::vector<FermionField> &lhs_wi,
 			     int lhs_start, int lhs_count,
 			     const std::vector<FermionField> &rhs_vj,
 			     int rhs_start, int rhs_count,
-			     Gamma::Algebra gamma);
+			     Gamma::Algebra gamma,
+			     int a2aBlock = A2Ablocking);
+
+  // Applies phase(x) * Gamma(g) * in(x) -> out(x) site-wise.
+  // Used by A2ANewMesonField to pre-contract right vectors before A2ASpatialSum.
+  static void PhaseContractRight(FermionField       &out,
+                                  const ComplexField &phase,
+                                  Gamma::Algebra      g,
+                                  const FermionField &in);
 
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
-  static void AslashField(TensorType &mat, 
+  static void AslashField(TensorType &mat,
 			  const FermionField *lhs_wi,
 			  const FermionField *rhs_vj,
 			  const std::vector<ComplexField> &emB0,
@@ -173,14 +183,16 @@ typedef Lattice<vVecComplex>               LatticeVecComplex;
 
 template <class FImpl>
 template <typename TensorType>
-void A2Autils<FImpl>::MesonField(TensorType &mat, 
+void A2Autils<FImpl>::MesonField(TensorType &mat,
 				 const FermionField *lhs_wi,
 				 const FermionField *rhs_vj,
 				 std::vector<Gamma::Algebra> gammas,
 				 const std::vector<ComplexField > &mom,
-				 int orthogdim) 
+				 int orthogdim,
+				 int a2aBlock)
 {
-  const int block=A2Ablocking;
+  GRID_ASSERT(a2aBlock <= A2Ablocking);
+  const int block = a2aBlock;
   typedef typename FImpl::SiteSpinor vobj;
 
   typedef typename vobj::scalar_object sobj;
@@ -287,46 +299,80 @@ void A2Autils<FImpl>::ZeroMesonField(Eigen::Tensor<ComplexD, 3> &mat,
 				     int lhs_start, int lhs_count,
 				     const std::vector<FermionField> &rhs_vj,
 				     int rhs_start, int rhs_count,
-				     Gamma::Algebra gamma)
+				     Gamma::Algebra gamma,
+				     int a2aBlock)
 {
   typedef iSpinColourVector<vector_type> SpinColourVector_v;
 
-  GridBase *grid   = lhs_wi[lhs_start].Grid();
-  int       Ni     = lhs_count;
-  int       Nj     = rhs_count;
-  int       Nsimd  = grid->Nsimd();
-  uint64_t  oSites = grid->oSites();
+  GridBase *grid      = lhs_wi[lhs_start].Grid();
+  int       Ni        = lhs_count;
+  int       Nj        = rhs_count;
+  int       Nsimd     = grid->Nsimd();
+  uint64_t  oSites    = grid->oSites();
+  int       nt_global = (int)mat.dimension(0);
 
   double t_gamma = 0;
   double t_gemm  = 0;
 
-  // Apply Gamma(gamma) to right vectors on GPU.
-  // gammaRight[j] = Gamma(gamma) * rhs_vj[rhs_start+j]
-  std::vector<FermionField> gammaRight(Nj, grid);
-  {
-    Gamma::Algebra ga = gamma;
-    for (int j = 0; j < Nj; j++) {
-      t_gamma -= usecond();
-      autoView(outv, gammaRight[j],          AcceleratorWrite);
-      autoView(inv,  rhs_vj[rhs_start + j],  AcceleratorRead);
-      accelerator_for(ss, oSites, (size_t)Nsimd, {
-        coalescedWrite(outv[ss], Gamma(ga) * inv(ss));
-      });
-      t_gamma += usecond();
+  // j-outer loop: apply gamma once per j-block, reuse across all i-blocks.
+  for (int jo = 0; jo < Nj; jo += a2aBlock) {
+    int Njj = std::min(Nj - jo, a2aBlock);
+
+    std::vector<FermionField> gammaRight(Njj, grid);
+    {
+      Gamma::Algebra ga = gamma;
+      for (int jj = 0; jj < Njj; jj++) {
+        t_gamma -= usecond();
+        autoView(outv, gammaRight[jj],                  AcceleratorWrite);
+        autoView(inv,  rhs_vj[rhs_start + jo + jj],    AcceleratorRead);
+        accelerator_for(ss, oSites, (size_t)Nsimd, {
+          coalescedWrite(outv[ss], Gamma(ga) * inv(ss));
+        });
+        t_gamma += usecond();
+      }
+    }
+
+    // i-inner loop: one batched GEMM per (i-block, j-block) pair.
+    for (int io = 0; io < Ni; io += a2aBlock) {
+      int Nii = std::min(Ni - io, a2aBlock);
+
+      t_gemm -= usecond();
+      A2ASpatialSum<SpinColourVector_v> spatial_sum;
+      spatial_sum.Allocate    (Nii, Njj, grid);
+      spatial_sum.PackLeftConj(lhs_wi,     lhs_start + io, Nii);
+      spatial_sum.PackRight   (gammaRight, 0,              Njj);
+
+      Eigen::Tensor<ComplexD, 3> mfChunk(nt_global, Nii, Njj);
+      spatial_sum.Sum(mfChunk);
+      t_gemm += usecond();
+
+      for (int t  = 0; t  < nt_global; t++)
+      for (int ii = 0; ii < Nii;       ii++)
+      for (int jj = 0; jj < Njj;       jj++)
+        mat(t, io + ii, jo + jj) = mfChunk(t, ii, jj);
     }
   }
 
-  // Batched GEMM + MPI reduction via A2ASpatialSum.
-  t_gemm -= usecond();
-  A2ASpatialSum<SpinColourVector_v> spatial_sum;
-  spatial_sum.Allocate    (Ni,      Nj,        grid);
-  spatial_sum.PackLeftConj(lhs_wi,  lhs_start, Ni);
-  spatial_sum.PackRight   (gammaRight, 0,       Nj);
-  spatial_sum.Sum(mat);
-  t_gemm += usecond();
-
   std::cout << GridLogMessage << " A2A::ZeroMesonField t_gamma " << t_gamma/1.e6 << "s" << std::endl;
   std::cout << GridLogMessage << " A2A::ZeroMesonField t_gemm  " << t_gemm/1.e6  << "s" << std::endl;
+}
+
+template <class FImpl>
+void A2Autils<FImpl>::PhaseContractRight(FermionField       &out,
+                                          const ComplexField &phase,
+                                          Gamma::Algebra      g,
+                                          const FermionField &in)
+{
+  GridBase     *grid   = in.Grid();
+  int           Nsimd  = grid->Nsimd();
+  uint64_t      oSites = grid->oSites();
+  Gamma::Algebra ga    = g;
+  autoView(out_v, out,   AcceleratorWrite);
+  autoView(in_v,  in,    AcceleratorRead);
+  autoView(ph_v,  phase, AcceleratorRead);
+  accelerator_for(ss, oSites, (size_t)Nsimd, {
+    coalescedWrite(out_v[ss], ph_v(ss) * (Gamma(ga) * in_v(ss)));
+  });
 }
 
 // "A-slash" field w_i(x)^dag * i * A_mu * gamma_mu * v_j(x)
