@@ -224,6 +224,200 @@ public:
     for (int j  = 0; j  < N_j;      j++)
       result(gt, i, j) = global_emf[gt * N_i * N_j + i * N_j + j];
   }
+
+  // Unpack a ComplexField phase into a flat array of one scalar per spatial site l_xyz.
+  // ph is assumed time-independent; all t-layers write the same value so redundant
+  // writes across timeslices are safe.  Mirrors the PackVectors SIMD/SIMT extraction.
+  template<class phvobj>
+  static void PackPhase(GridBase *_grid, const Lattice<phvobj> &ph,
+                        deviceVector<scalar> &phase_buf)
+  {
+    int nd     = _grid->_ndimension;
+    int lnt    = _grid->LocalDimensions()[nd - 1];
+    int lnxyz  = _grid->lSites() / lnt;
+    int osites = _grid->oSites();
+    int lNsimd = _grid->Nsimd();
+
+    phase_buf.resize(lnxyz);
+    scalar *phase_data = &phase_buf[0];
+
+    Coordinate rdimensions = _grid->_rdimensions;
+    Coordinate ldims       = _grid->LocalDimensions();
+    Coordinate simd_layout = _grid->_simd_layout;
+
+    autoView(ph_v, ph, AcceleratorRead);
+
+    accelerator_for(sf, osites, lNsimd, {
+#ifdef GRID_SIMT
+      {
+        int lane = acceleratorSIMTlane(lNsimd);
+#else
+        for (int lane = 0; lane < lNsimd; lane++) {
+#endif
+        Coordinate icoor(nd), ocoor(nd), lcoor(nd);
+        Lexicographic::CoorFromIndex(icoor, lane, simd_layout);
+        Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
+        for (int d = 0; d < nd; d++)
+          lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
+
+        Coordinate xyz_coor = lcoor;
+        xyz_coor[nd - 1]    = 0;
+        int64_t l_xyz;
+        Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
+
+        auto    ph_site = extractLane(lane, ph_v[sf]);
+        scalar *ph_s    = (scalar *)&ph_site;
+        phase_data[l_xyz] = ph_s[0];
+      }
+    });
+  }
+
+  // Multiply LR_buf[t][j][l_xyz*Nsc + sc] by phase_buf[l_xyz] for all (t, j, sc).
+  // One thread per (j, l_xyz); inner loop over (t, sc) is sequential.
+  void ApplyPhaseRight(const deviceVector<scalar> &phase_buf)
+  {
+    scalar       *LR  = &LR_buf[0];
+    const scalar *ph  = &phase_buf[0];
+    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnt = nt;
+    accelerator_for(idx, (size_t)(lN_j * lnxyz), 1, {
+      int    j     = idx / lnxyz;
+      int    l_xyz = idx % lnxyz;
+      scalar ph_val = ph[l_xyz];
+      for (int t = 0; t < lnt; t++) {
+        int64_t base = (int64_t)t * lN_j * lnxyz * lNsc
+                     + (int64_t)j * lnxyz * lNsc
+                     + l_xyz * lNsc;
+        for (int sc = 0; sc < lNsc; sc++)
+          LR[base + sc] *= ph_val;
+      }
+    });
+  }
+
+  // Multiply LR_buf by conj(phase_buf[l_xyz]) — undoes ApplyPhaseRight exactly.
+  void RestorePhaseRight(const deviceVector<scalar> &phase_buf)
+  {
+    scalar       *LR  = &LR_buf[0];
+    const scalar *ph  = &phase_buf[0];
+    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnt = nt;
+    accelerator_for(idx, (size_t)(lN_j * lnxyz), 1, {
+      int    j     = idx / lnxyz;
+      int    l_xyz = idx % lnxyz;
+      scalar ph_val = Grid::conjugate(ph[l_xyz]);
+      for (int t = 0; t < lnt; t++) {
+        int64_t base = (int64_t)t * lN_j * lnxyz * lNsc
+                     + (int64_t)j * lnxyz * lNsc
+                     + l_xyz * lNsc;
+        for (int sc = 0; sc < lNsc; sc++)
+          LR[base + sc] *= ph_val;
+      }
+    });
+  }
+
+  // Like Allocate, but splits each SpinColourVector into Ns spin rows.
+  // N_i = _Nii * Ns, N_j = _Njj * Ns, Nsc = Nc = 3.
+  // GEMM output [nt, Nii*Ns, Njj*Ns] enables post-GEMM gamma trace over all gammas.
+  void AllocateSpin(int _Nii, int _Njj, GridBase *_grid)
+  {
+    const int Ns_qcd = 4;
+    grid  = _grid;
+    N_i   = _Nii * Ns_qcd;
+    N_j   = _Njj * Ns_qcd;
+    Coordinate ldims = grid->LocalDimensions();
+    nt    = ldims[grid->Nd() - 1];
+    nxyz  = grid->lSites() / nt;
+    int Nsc_full = sizeof(sobj) / sizeof(scalar); // = 12 for SpinColourVector
+    Nsc   = Nsc_full / Ns_qcd;                   // = 3 = Nc
+
+    W_buf.resize(nt * N_i * nxyz * Nsc);
+    LR_buf.resize(nt * N_j * nxyz * Nsc);
+    EMF_buf.resize(nt * N_j * N_i);
+
+    W_ptrs.resize(nt);
+    LR_ptrs.resize(nt);
+    EMF_ptrs.resize(nt);
+    scalar *Wh   = &W_buf[0];
+    scalar *LRh  = &LR_buf[0];
+    scalar *EMFh = &EMF_buf[0];
+    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
+    for (int t = 0; t < nt; t++) {
+      acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
+      acceleratorPut(LR_ptrs[t],  LRh  + t * lN_j * lnxyz * lNsc);
+      acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
+    }
+  }
+
+  void PackLeftConjSpin(const std::vector<Lattice<vobj>> &left, int start = 0, int count = -1)
+  {
+    const int Ns_qcd = 4;
+    if (count < 0) count = (int)left.size();
+    GRID_ASSERT(start + count <= (int)left.size());
+    GRID_ASSERT(count * Ns_qcd == N_i);
+    PackVectorsSpin<true>(left, &W_buf[0], count, start);
+  }
+
+  void PackRightSpin(const std::vector<Lattice<vobj>> &right, int start = 0, int count = -1)
+  {
+    const int Ns_qcd = 4;
+    if (count < 0) count = (int)right.size();
+    GRID_ASSERT(start + count <= (int)right.size());
+    GRID_ASSERT(count * Ns_qcd == N_j);
+    PackVectorsSpin<false>(right, &LR_buf[0], count, start);
+  }
+
+  // Pack N spin-colour vectors from vecs[start..start+N-1] into buf[nt][N*Ns][nxyz*Nc].
+  // Mode n, spin s1 → row (n*Ns + s1); color elements indexed by l_xyz*Nc + c.
+  // DoConj=true conjugates each element during extraction (for PackLeftConjSpin).
+  template<bool DoConj = false>
+  void PackVectorsSpin(const std::vector<Lattice<vobj>> &vecs, scalar *buf, int N, int start = 0)
+  {
+    const int Ns_qcd = 4;
+    int nd     = grid->_ndimension;
+    int osites = grid->oSites();
+    int Nsimd  = vobj::Nsimd();
+    int lN_tot = N * Ns_qcd;   // total rows in buf per timeslice (= N_i or N_j)
+    int lNc    = Nsc;          // = Nc = 3, set by AllocateSpin
+    int lnxyz  = nxyz;
+    Coordinate rdimensions = grid->_rdimensions;
+    Coordinate ldims       = grid->LocalDimensions();
+    Coordinate simd        = grid->_simd_layout;
+
+    for (int n = 0; n < N; n++) {
+      autoView(src_v, vecs[start + n], AcceleratorRead);
+      accelerator_for(sf, osites, Nsimd, {
+#ifdef GRID_SIMT
+        {
+          int lane = acceleratorSIMTlane(Nsimd);
+#else
+          for (int lane = 0; lane < Nsimd; lane++) {
+#endif
+          Coordinate icoor(nd), ocoor(nd), lcoor(nd);
+          Lexicographic::CoorFromIndex(icoor, lane, simd);
+          Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
+          for (int d = 0; d < nd; d++)
+            lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
+
+          int     l_t = lcoor[nd - 1];
+          Coordinate xyz_coor = lcoor;
+          xyz_coor[nd - 1] = 0;
+          int64_t l_xyz;
+          Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
+
+          sobj    data   = extractLane(lane, src_v[sf]);
+          if constexpr (DoConj) data = conjugate(data);
+          scalar *data_s = (scalar *)&data;
+
+          for (int s1 = 0; s1 < Ns_qcd; s1++) {
+            int64_t row  = (int64_t)n * Ns_qcd + s1;
+            int64_t base = (int64_t)l_t * lN_tot * lnxyz * lNc
+                         + row           * lnxyz  * lNc
+                         + l_xyz         * lNc;
+            for (int c = 0; c < lNc; c++)
+              buf[base + c] = data_s[s1 * lNc + c];
+          }
+        }
+      });
+    }
+  }
 };
 
 NAMESPACE_END(Grid);

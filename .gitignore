@@ -42,6 +42,7 @@ latex/*
 *.exe
 *.out
 *.app
+*.sh
 
 # http://www.gnu.org/software/automake #
 ########################################

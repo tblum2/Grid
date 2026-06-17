@@ -97,6 +97,12 @@ public:
                                   Gamma::Algebra      g,
                                   const FermionField &in);
 
+  // Applies Gamma(g) * in(x) -> out(x) site-wise, without phase.
+  // Used by A2ANewMesonField (phase-trick path) as the zero-momentum base pack.
+  static void GammaRight(FermionField       &out,
+                          Gamma::Algebra      g,
+                          const FermionField &in);
+
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   static void AslashField(TensorType &mat,
 			  const FermionField *lhs_wi,
@@ -372,6 +378,22 @@ void A2Autils<FImpl>::PhaseContractRight(FermionField       &out,
   autoView(ph_v,  phase, AcceleratorRead);
   accelerator_for(ss, oSites, (size_t)Nsimd, {
     coalescedWrite(out_v[ss], ph_v(ss) * (Gamma(ga) * in_v(ss)));
+  });
+}
+
+template <class FImpl>
+void A2Autils<FImpl>::GammaRight(FermionField       &out,
+                                   Gamma::Algebra      g,
+                                   const FermionField &in)
+{
+  GridBase     *grid   = in.Grid();
+  int           Nsimd  = grid->Nsimd();
+  uint64_t      oSites = grid->oSites();
+  Gamma::Algebra ga    = g;
+  autoView(out_v, out, AcceleratorWrite);
+  autoView(in_v,  in,  AcceleratorRead);
+  accelerator_for(ss, oSites, (size_t)Nsimd, {
+    coalescedWrite(out_v[ss], Gamma(ga) * in_v(ss));
   });
 }
 
