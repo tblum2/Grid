@@ -64,18 +64,16 @@ public:
 			 const FermionField *rhs_vj,
 			 std::vector<Gamma::Algebra> gammas,
 			 const std::vector<ComplexField > &mom,
-			 int orthogdim,
-			 int a2aBlock = A2Ablocking);
+			 int orthogdim);
   template <typename TensorType>
   static void MesonField(TensorType &mat,
 			 const FermionField *lhs_wi,
 			 const FermionField *rhs_vj,
 			 std::vector<Gamma::Algebra> gammas,
 			 const std::vector<ComplexField > &mom,
-			 int orthogdim, double *timer,
-			 int a2aBlock = A2Ablocking)
+			 int orthogdim, double *timer);
   {
-    MesonField(mat, lhs_wi, rhs_vj, gammas, mom, orthogdim, a2aBlock);
+    MesonField(mat, lhs_wi, rhs_vj, gammas, mom, orthogdim);
   }
 
   // Zero-momentum meson field via batched GEMM (no MomentumProject).
@@ -88,7 +86,7 @@ public:
 			     const std::vector<FermionField> &rhs_vj,
 			     int rhs_start, int rhs_count,
 			     Gamma::Algebra gamma,
-			     int a2aBlock = A2Ablocking);
+			     int a2aBlock);
 
   // Applies phase(x) * Gamma(g) * in(x) -> out(x) site-wise.
   // Used by A2ANewMesonField to pre-contract right vectors before A2ASpatialSum.
@@ -173,7 +171,7 @@ private:
                                const int Ns, const int ss);
 };
 
-const int A2Ablocking=8;
+const int A2Ablocking=96;
 
 template<typename vtype> using iVecSpinMatrix = iVector<iMatrix<iScalar<vtype>, Ns>, A2Ablocking>;
 typedef iVecSpinMatrix<Complex  >             VecSpinMatrix;
@@ -194,11 +192,9 @@ void A2Autils<FImpl>::MesonField(TensorType &mat,
 				 const FermionField *rhs_vj,
 				 std::vector<Gamma::Algebra> gammas,
 				 const std::vector<ComplexField > &mom,
-				 int orthogdim,
-				 int a2aBlock)
+				 int orthogdim)
 {
-  GRID_ASSERT(a2aBlock <= A2Ablocking);
-  const int block = a2aBlock;
+  const int block = A2Ablocking;
   typedef typename FImpl::SiteSpinor vobj;
 
   typedef typename vobj::scalar_object sobj;
