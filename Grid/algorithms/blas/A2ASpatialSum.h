@@ -65,6 +65,7 @@ public:
 
   deviceVector<scalar>   W_buf;
   deviceVector<scalar>   LR_buf;
+  deviceVector<scalar>   LR_sct;  // [t][x][sc][j] layout for coalesced SpinColorTrace
   deviceVector<scalar>   EMF_buf;
   deviceVector<scalar *> W_ptrs;
   deviceVector<scalar *> LR_ptrs;
@@ -84,6 +85,7 @@ public:
   
     W_buf.resize(nt * N_i * nxyz * Nsc);
     LR_buf.resize(nt * N_j * nxyz * Nsc);
+    LR_sct.resize(nt * nxyz * Nsc * N_j);
     EMF_buf.resize(nt * N_j * N_i);
   
     // Build persistent batch pointer arrays
@@ -124,6 +126,56 @@ public:
     GRID_ASSERT(start + count <= (int)left.size());
     GRID_ASSERT(count == N_i);
     PackVectors<true>(left, &W_buf[0], N_i, start);
+  }
+
+  // Pack right into LR_sct[t][x][sc][j] for coalesced SpinColorTrace reads.
+  // j is innermost: adjacent threads in a wavefront access stride-1 memory.
+  void PackRightSCT(const std::vector<Lattice<vobj>> &right, int start = 0, int count = -1)
+  {
+    if (count < 0) count = (int)right.size();
+    GRID_ASSERT(start + count <= (int)right.size());
+    GRID_ASSERT(count == N_j);
+
+    int nd     = grid->_ndimension;
+    int osites = grid->oSites();
+    int Nsimd  = vobj::Nsimd();
+    int lN_j   = N_j, lNsc = Nsc, lnxyz = nxyz;
+    Coordinate rdimensions = grid->_rdimensions;
+    Coordinate ldims       = grid->LocalDimensions();
+    Coordinate simd_layout = grid->_simd_layout;
+    scalar *buf = &LR_sct[0];
+
+    for (int n = 0; n < N_j; n++) {
+      autoView(src_v, right[start + n], AcceleratorRead);
+      accelerator_for(sf, (size_t)osites, Nsimd, {
+#ifdef GRID_SIMT
+        {
+          int lane = acceleratorSIMTlane(Nsimd);
+#else
+          for (int lane = 0; lane < Nsimd; lane++) {
+#endif
+          Coordinate icoor(nd), ocoor(nd), lcoor(nd);
+          Lexicographic::CoorFromIndex(icoor, lane, simd_layout);
+          Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
+          for (int d = 0; d < nd; d++)
+            lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
+
+          int l_t = lcoor[nd - 1];
+          Coordinate xyz_coor = lcoor;
+          xyz_coor[nd - 1] = 0;
+          int64_t l_xyz;
+          Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
+
+          sobj    data   = extractLane(lane, src_v[sf]);
+          scalar *data_s = (scalar *)&data;
+
+          int64_t base = (int64_t)l_t * lnxyz * lNsc * lN_j
+                       + l_xyz * lNsc * lN_j;
+          for (int sc = 0; sc < lNsc; sc++)
+            buf[base + sc * lN_j + n] = data_s[sc];
+        }
+      });
+    }
   }
 
 public:

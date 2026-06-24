@@ -90,13 +90,13 @@ public:
                           const FermionField &in);
 
   // Phase 1: SC inner product with on-the-fly gamma application, no phase.
-  // W_buf: conj(left) packed as [nt][Nii][nxyz*Nsc] by PackLeftConj.
-  // LR_buf: right (no gamma) packed as [nt][Njj][nxyz*Nsc] by PackRight.
+  // W_buf: conj(left) packed as [t][i][x][sc] by PackLeftConjSCT.
+  // LR_sct: right packed as [t][x][sc][j] by PackRightSCT (coalesced).
   // q_buf output layout: [(t*nxyz+x)*Nii*Njj + i*Njj + j].
   static void SpinColorTrace(
       deviceVector<scalar_type>       &q_buf,
       const deviceVector<scalar_type> &W_buf,
-      const deviceVector<scalar_type> &LR_buf,
+      const deviceVector<scalar_type> &LR_sct,
       Gamma::Algebra ga,
       int Nii, int Njj, int nt, int nxyz, int Nsc);
 
@@ -356,9 +356,8 @@ void A2Autils<FImpl>::GammaRight(FermionField       &out,
 // SpinColorTrace: Phase 1 of the momentum-factored meson field.
 // Each thread computes q[(t*nxyz+x)*Nii*Njj + i*Njj + j]
 //   = sum_sc conj(left)[t][i][x,sc] * (Gamma * right)[t][j][x,sc].
-// W_buf holds conj(left) via PackLeftConj; LR_buf holds right with no gamma via PackRight.
-// Gamma is applied to LR on-the-fly using Grid's accelerator_inline Gamma operator,
-// following the same cast pattern as PackVectors (scalar_type* alias of sobj).
+// W_buf layout [t][i][x][sc]: broadcast within wavefront (all threads share same i).
+// LR_sct layout [t][x][sc][j]: j innermost gives stride-1 coalescing across threads.
 template <class FImpl>
 void A2Autils<FImpl>::SpinColorTrace(
     deviceVector<scalar_type>       &q_buf,
@@ -384,12 +383,12 @@ void A2Autils<FImpl>::SpinColorTrace(
     int x   = rem / lNii;
     int i   = rem % lNii;
 
-    int64_t w_base  = (int64_t)t * lNii * lnxyz * lNsc + i * lnxyz * lNsc + x * lNsc;
-    int64_t lr_base = (int64_t)t * lNjj * lnxyz * lNsc + lj * lnxyz * lNsc + x * lNsc;
+    int64_t w_base    = (int64_t)t * lNii * lnxyz * lNsc + i * lnxyz * lNsc + x * lNsc;
+    int64_t lr_txbase = (int64_t)t * lnxyz * lNsc * lNjj + (int64_t)x * lNsc * lNjj;
 
     sobj lr_site;
     scalar_type *lr_s = (scalar_type *)&lr_site;
-    for (int sc = 0; sc < lNsc; sc++) lr_s[sc] = LR[lr_base + sc];
+    for (int sc = 0; sc < lNsc; sc++) lr_s[sc] = LR[lr_txbase + sc * lNjj + lj];
 
     sobj gamma_lr      = Gamma(lga) * lr_site;
     scalar_type *glr_s = (scalar_type *)&gamma_lr;
@@ -486,7 +485,7 @@ void A2Autils<FImpl>::MomMesonField(
     int64_t q_t_base = (int64_t)t * lnxyz * lNiNj;
     int     ph_base  = m * lnxyz;
 
-    scalar_type acc = Zero();
+    scalar_type acc = 0;
     for (int x = 0; x < lnxyz; x++)
       acc += Q[q_t_base + x * lNiNj + lij] * Ph[ph_base + x];
 
