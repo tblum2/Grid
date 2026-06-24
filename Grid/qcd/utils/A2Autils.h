@@ -76,18 +76,6 @@ public:
     MesonField(mat, lhs_wi, rhs_vj, gammas, mom, orthogdim);
   }
 
-  // Zero-momentum meson field via batched GEMM (no MomentumProject).
-  // mat must have shape [Nt_global, lhs_count, rhs_count].
-  // Internally blocks rhs in groups of a2aBlock, applying gamma once per j-block
-  // and reusing across all i-blocks; then calls A2ASpatialSum per (i-block, j-block).
-  static void ZeroMesonField(Eigen::Tensor<ComplexD, 3> &mat,
-			     const std::vector<FermionField> &lhs_wi,
-			     int lhs_start, int lhs_count,
-			     const std::vector<FermionField> &rhs_vj,
-			     int rhs_start, int rhs_count,
-			     Gamma::Algebra gamma,
-			     int a2aBlock);
-
   // Applies phase(x) * Gamma(g) * in(x) -> out(x) site-wise.
   // Used by A2ANewMesonField to pre-contract right vectors before A2ASpatialSum.
   static void PhaseContractRight(FermionField       &out,
@@ -100,6 +88,42 @@ public:
   static void GammaRight(FermionField       &out,
                           Gamma::Algebra      g,
                           const FermionField &in);
+
+  // Phase 1: SC inner product with on-the-fly gamma application, no phase.
+  // W_buf: conj(left) packed as [nt][Nii][nxyz*Nsc] by PackLeftConj.
+  // LR_buf: right (no gamma) packed as [nt][Njj][nxyz*Nsc] by PackRight.
+  // q_buf output layout: [(t*nxyz+x)*Nii*Njj + i*Njj + j].
+  static void SpinColorTrace(
+      deviceVector<scalar_type>       &q_buf,
+      const deviceVector<scalar_type> &W_buf,
+      const deviceVector<scalar_type> &LR_buf,
+      Gamma::Algebra ga,
+      int Nii, int Njj, int nt, int nxyz, int Nsc);
+
+  // Phase 2: spatial reduction with all momenta simultaneously.
+  // q_buf from SpinColorTrace; phase_all packed as [m*nxyz + x].
+  // result: rank-4 tensor [nt_global][Nii][Njj][nmom].
+  static void MomMesonField(
+      Eigen::Tensor<ComplexD, 4>      &result,
+      const deviceVector<scalar_type> &q_buf,
+      const deviceVector<scalar_type> &phase_all,
+      int Nii, int Njj, int nt_local, int nxyz, int nmom,
+      GridBase *grid);
+
+  // Phase 2 BLAS path: gemmBatched(OP_N, OP_N, Nii*Njj, nmom, nxyz) over nt_local slices.
+  // Same q_buf and phase_all layout as MomMesonField; no custom kernel, no repacking.
+  static void MomMesonFieldBLAS(
+      Eigen::Tensor<ComplexD, 4>      &result,
+      const deviceVector<scalar_type> &q_buf,
+      const deviceVector<scalar_type> &phase_all,
+      int Nii, int Njj, int nt_local, int nxyz, int nmom,
+      GridBase *grid);
+
+  // Pack all momenta phase fields into a single flat buffer: [m*nxyz + x].
+  static void PackAllPhases(
+      GridBase *grid,
+      const std::vector<ComplexField> &ph,
+      deviceVector<scalar_type> &phase_all);
 
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   static void AslashField(TensorType &mat,
@@ -296,69 +320,6 @@ void A2Autils<FImpl>::MesonField(TensorType &mat,
 }
 
 template <class FImpl>
-void A2Autils<FImpl>::ZeroMesonField(Eigen::Tensor<ComplexD, 3> &mat,
-				     const std::vector<FermionField> &lhs_wi,
-				     int lhs_start, int lhs_count,
-				     const std::vector<FermionField> &rhs_vj,
-				     int rhs_start, int rhs_count,
-				     Gamma::Algebra gamma,
-				     int a2aBlock)
-{
-  typedef iSpinColourVector<vector_type> SpinColourVector_v;
-
-  GridBase *grid      = lhs_wi[lhs_start].Grid();
-  int       Ni        = lhs_count;
-  int       Nj        = rhs_count;
-  int       Nsimd     = grid->Nsimd();
-  uint64_t  oSites    = grid->oSites();
-  int       nt_global = (int)mat.dimension(0);
-
-  double t_gamma = 0;
-  double t_gemm  = 0;
-
-  // j-outer loop: apply gamma once per j-block, reuse across all i-blocks.
-  for (int jo = 0; jo < Nj; jo += a2aBlock) {
-    int Njj = std::min(Nj - jo, a2aBlock);
-
-    std::vector<FermionField> gammaRight(Njj, grid);
-    {
-      Gamma::Algebra ga = gamma;
-      for (int jj = 0; jj < Njj; jj++) {
-        t_gamma -= usecond();
-        autoView(outv, gammaRight[jj],                  AcceleratorWrite);
-        autoView(inv,  rhs_vj[rhs_start + jo + jj],    AcceleratorRead);
-        accelerator_for(ss, oSites, (size_t)Nsimd, {
-          coalescedWrite(outv[ss], Gamma(ga) * inv(ss));
-        });
-        t_gamma += usecond();
-      }
-    }
-
-    // i-inner loop: one batched GEMM per (i-block, j-block) pair.
-    for (int io = 0; io < Ni; io += a2aBlock) {
-      int Nii = std::min(Ni - io, a2aBlock);
-
-      t_gemm -= usecond();
-      A2ASpatialSum<SpinColourVector_v> spatial_sum;
-      spatial_sum.Allocate    (Nii, Njj, grid);
-      spatial_sum.PackLeftConj(lhs_wi,     lhs_start + io, Nii);
-      spatial_sum.PackRight   (gammaRight, 0,              Njj);
-
-      Eigen::Tensor<ComplexD, 3> mfChunk(nt_global, Nii, Njj);
-      spatial_sum.Sum(mfChunk);
-      t_gemm += usecond();
-
-      for (int t  = 0; t  < nt_global; t++)
-      for (int ii = 0; ii < Nii;       ii++)
-      for (int jj = 0; jj < Njj;       jj++)
-        mat(t, io + ii, jo + jj) = mfChunk(t, ii, jj);
-    }
-  }
-
-  std::cout << GridLogMessage << " A2A::ZeroMesonField t_gamma " << t_gamma/1.e6 << "s" << std::endl;
-  std::cout << GridLogMessage << " A2A::ZeroMesonField t_gemm  " << t_gemm/1.e6  << "s" << std::endl;
-}
-
 template <class FImpl>
 void A2Autils<FImpl>::PhaseContractRight(FermionField       &out,
                                           const ComplexField &phase,
@@ -391,6 +352,242 @@ void A2Autils<FImpl>::GammaRight(FermionField       &out,
   accelerator_for(ss, oSites, (size_t)Nsimd, {
     coalescedWrite(out_v[ss], Gamma(ga) * in_v(ss));
   });
+}
+
+// SpinColorTrace: Phase 1 of the momentum-factored meson field.
+// Each thread computes q[(t*nxyz+x)*Nii*Njj + i*Njj + j]
+//   = sum_sc conj(left)[t][i][x,sc] * (Gamma * right)[t][j][x,sc].
+// W_buf holds conj(left) via PackLeftConj; LR_buf holds right with no gamma via PackRight.
+// Gamma is applied to LR on-the-fly using Grid's accelerator_inline Gamma operator,
+// following the same cast pattern as PackVectors (scalar_type* alias of sobj).
+template <class FImpl>
+void A2Autils<FImpl>::SpinColorTrace(
+    deviceVector<scalar_type>       &q_buf,
+    const deviceVector<scalar_type> &W_buf,
+    const deviceVector<scalar_type> &LR_buf,
+    Gamma::Algebra ga,
+    int Nii, int Njj, int nt, int nxyz, int Nsc)
+{
+  q_buf.resize((int64_t)nt * nxyz * Nii * Njj);
+
+  const scalar_type *W  = &W_buf[0];
+  const scalar_type *LR = &LR_buf[0];
+  scalar_type       *Q  = &q_buf[0];
+  int lNii = Nii, lNjj = Njj, lnt = nt, lnxyz = nxyz, lNsc = Nsc;
+  Gamma::Algebra lga = ga;
+
+  // iter2 = ti = (t*nxyz+x)*Nii + i, one block per (t,x,i) triple.
+  // iter1 = j, one thread per j; consecutive j -> stride-1 write to Q (coalesced).
+  accelerator_for2d(j, (size_t)lNjj, ti, (size_t)lnt * lnxyz * lNii, 1, {
+    int lj  = (int)j;
+    int t   = (int)(ti / ((size_t)lnxyz * lNii));
+    int rem = (int)(ti % ((size_t)lnxyz * lNii));
+    int x   = rem / lNii;
+    int i   = rem % lNii;
+
+    int64_t w_base  = (int64_t)t * lNii * lnxyz * lNsc + i * lnxyz * lNsc + x * lNsc;
+    int64_t lr_base = (int64_t)t * lNjj * lnxyz * lNsc + lj * lnxyz * lNsc + x * lNsc;
+
+    sobj lr_site;
+    scalar_type *lr_s = (scalar_type *)&lr_site;
+    for (int sc = 0; sc < lNsc; sc++) lr_s[sc] = LR[lr_base + sc];
+
+    sobj gamma_lr      = Gamma(lga) * lr_site;
+    scalar_type *glr_s = (scalar_type *)&gamma_lr;
+
+    scalar_type result = Zero();
+    for (int sc = 0; sc < lNsc; sc++)
+      result += W[w_base + sc] * glr_s[sc];
+
+    Q[(int64_t)ti * lNjj + lj] = result;
+  });
+}
+
+// PackAllPhases: packs nmom ComplexField phase arrays into phase_all[m*nxyz + x].
+// Mirrors A2ASpatialSum::PackPhase but writes all momenta into one contiguous buffer.
+template <class FImpl>
+void A2Autils<FImpl>::PackAllPhases(
+    GridBase *grid,
+    const std::vector<ComplexField> &ph,
+    deviceVector<scalar_type> &phase_all)
+{
+  int nd     = grid->_ndimension;
+  int lnt    = grid->LocalDimensions()[nd - 1];
+  int lnxyz  = grid->lSites() / lnt;
+  int nmom   = (int)ph.size();
+  int osites = grid->oSites();
+  int lNsimd = grid->Nsimd();
+
+  phase_all.resize((int64_t)nmom * lnxyz);
+  scalar_type *ph_all = &phase_all[0];
+
+  Coordinate rdimensions = grid->_rdimensions;
+  Coordinate ldims       = grid->LocalDimensions();
+  Coordinate simd_layout = grid->_simd_layout;
+
+  int lNxyz = lnxyz;
+  for (int m = 0; m < nmom; m++) {
+    autoView(ph_v, ph[m], AcceleratorRead);
+    int lm = m;
+    accelerator_for(sf, (size_t)osites, lNsimd, {
+#ifdef GRID_SIMT
+      {
+        int lane = acceleratorSIMTlane(lNsimd);
+#else
+        for (int lane = 0; lane < lNsimd; lane++) {
+#endif
+        Coordinate icoor(nd), ocoor(nd), lcoor(nd);
+        Lexicographic::CoorFromIndex(icoor, lane, simd_layout);
+        Lexicographic::CoorFromIndex(ocoor, sf,   rdimensions);
+        for (int d = 0; d < nd; d++)
+          lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
+
+        Coordinate xyz_coor = lcoor;
+        xyz_coor[nd - 1]    = 0;
+        int64_t l_xyz;
+        Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
+
+        auto         ph_site = extractLane(lane, ph_v[sf]);
+        scalar_type *ph_s    = (scalar_type *)&ph_site;
+        ph_all[(int64_t)lm * lNxyz + l_xyz] = ph_s[0];
+      }
+    });
+  }
+}
+
+// MomMesonField: Phase 2 of the momentum-factored meson field.
+// Each thread accumulates mf[t][i][j][m] = sum_x q[(t*nxyz+x)*Nii*Njj + ij] * phase[m*nxyz+x].
+// Followed by MPI GlobalSumVector to combine contributions across spatial ranks.
+// result(gt, i, j, m) is filled for all nt_global timeslices and all nmom momenta.
+template <class FImpl>
+void A2Autils<FImpl>::MomMesonField(
+    Eigen::Tensor<ComplexD, 4>      &result,
+    const deviceVector<scalar_type> &q_buf,
+    const deviceVector<scalar_type> &phase_all,
+    int Nii, int Njj, int nt_local, int nxyz, int nmom,
+    GridBase *grid)
+{
+  deviceVector<scalar_type> mf_buf((int64_t)nmom * nt_local * Nii * Njj);
+
+  const scalar_type *Q  = &q_buf[0];
+  const scalar_type *Ph = &phase_all[0];
+  scalar_type       *MF = &mf_buf[0];
+  int lNii = Nii, lNjj = Njj, lnt = nt_local, lnxyz = nxyz, lnmom = nmom;
+  int lNiNj = Nii * Njj;
+
+  // iter2 = mt = m*nt_local + t, one block per (m,t).
+  // iter1 = ij = i*Njj + j, one thread per mode pair.
+  // Consecutive ij -> stride-1 reads of Q and writes to MF (coalesced across warp).
+  // Ph[m*nxyz + x] is identical for all ij threads at the same (m,t,x) -> broadcast.
+  accelerator_for2d(ij, (size_t)lNiNj, mt, (size_t)lnmom * lnt, 1, {
+    int lij = (int)ij;
+    int m   = (int)(mt / lnt);
+    int t   = (int)(mt % lnt);
+
+    int64_t q_t_base = (int64_t)t * lnxyz * lNiNj;
+    int     ph_base  = m * lnxyz;
+
+    scalar_type acc = Zero();
+    for (int x = 0; x < lnxyz; x++)
+      acc += Q[q_t_base + x * lNiNj + lij] * Ph[ph_base + x];
+
+    MF[(int64_t)mt * lNiNj + lij] = acc;
+  });
+
+  int nt_global = result.dimension(0);
+  int nd        = grid->Nd();
+  int lt_start  = grid->LocalStarts()[nd - 1];
+
+  std::vector<scalar_type> host_mf((int64_t)nmom * nt_local * Nii * Njj);
+  acceleratorCopyFromDevice(MF, host_mf.data(),
+                            host_mf.size() * sizeof(scalar_type));
+
+  std::vector<scalar_type> global_mf((int64_t)nt_global * Nii * Njj * nmom,
+                                     scalar_type(0));
+  for (int lt = 0; lt < nt_local; lt++) {
+    int gt = lt + lt_start;
+    for (int i = 0; i < Nii; i++)
+    for (int j = 0; j < Njj; j++)
+    for (int m = 0; m < nmom; m++)
+      global_mf[((int64_t)gt * Nii * Njj + i * Njj + j) * nmom + m]
+          = host_mf[((int64_t)m * nt_local + lt) * Nii * Njj + i * Njj + j];
+  }
+  grid->GlobalSumVector(global_mf.data(), (int64_t)nt_global * Nii * Njj * nmom);
+
+  for (int gt = 0; gt < nt_global; gt++)
+  for (int i  = 0; i  < Nii;      i++)
+  for (int j  = 0; j  < Njj;      j++)
+  for (int m  = 0; m  < nmom;     m++)
+    result(gt, i, j, m) =
+        global_mf[((int64_t)gt * Nii * Njj + i * Njj + j) * nmom + m];
+}
+
+// MomMesonFieldBLAS: Phase 2 using gemmBatched instead of the custom kernel.
+// gemmBatched(OP_N, OP_N, M=Nii*Njj, N=nmom, K=nxyz) over nt_local slices.
+// q_buf layout [(t*nxyz+x)*NiNj+ij] is A_Fortran[ij][x] with lda=NiNj (OP_N -> lda=M).
+// phase_all layout [m*nxyz+x] is B_Fortran[x][m] with ldb=nxyz (OP_N on B -> ldb=K).
+// Output C_Fortran[ij][m] with ldc=NiNj; read back as mf[(t*nmom+m)*NiNj+ij].
+template <class FImpl>
+void A2Autils<FImpl>::MomMesonFieldBLAS(
+    Eigen::Tensor<ComplexD, 4>      &result,
+    const deviceVector<scalar_type> &q_buf,
+    const deviceVector<scalar_type> &phase_all,
+    int Nii, int Njj, int nt_local, int nxyz, int nmom,
+    GridBase *grid)
+{
+  int lNiNj = Nii * Njj;
+  deviceVector<scalar_type> mf_buf((int64_t)nt_local * lNiNj * nmom);
+
+  scalar_type *Q  = const_cast<scalar_type*>(&q_buf[0]);
+  scalar_type *Ph = const_cast<scalar_type*>(&phase_all[0]);
+  scalar_type *MF = &mf_buf[0];
+
+  deviceVector<scalar_type*> q_ptrs(nt_local);
+  deviceVector<scalar_type*> ph_ptrs(nt_local);
+  deviceVector<scalar_type*> mf_ptrs(nt_local);
+  int lnxyz = nxyz, lnmom = nmom;
+  for (int t = 0; t < nt_local; t++) {
+    acceleratorPut(q_ptrs[t],  Q  + (int64_t)t * lnxyz * lNiNj);
+    acceleratorPut(ph_ptrs[t], Ph);
+    acceleratorPut(mf_ptrs[t], MF + (int64_t)t * lNiNj * lnmom);
+  }
+
+  GridBLAS BLAS;
+  BLAS.gemmBatched(GridBLAS_OP_N, GridBLAS_OP_N,
+                   lNiNj, nmom, nxyz,
+                   scalar_type(1.0),
+                   q_ptrs,
+                   ph_ptrs,
+                   scalar_type(0.0),
+                   mf_ptrs);
+  BLAS.synchronise();
+
+  int nt_global = result.dimension(0);
+  int nd        = grid->Nd();
+  int lt_start  = grid->LocalStarts()[nd - 1];
+
+  std::vector<scalar_type> host_mf((int64_t)nt_local * lNiNj * nmom);
+  acceleratorCopyFromDevice(MF, host_mf.data(),
+                            host_mf.size() * sizeof(scalar_type));
+
+  std::vector<scalar_type> global_mf((int64_t)nt_global * Nii * Njj * nmom,
+                                     scalar_type(0));
+  for (int lt = 0; lt < nt_local; lt++) {
+    int gt = lt + lt_start;
+    for (int i = 0; i < Nii; i++)
+    for (int j = 0; j < Njj; j++)
+    for (int m = 0; m < nmom; m++)
+      global_mf[((int64_t)gt * Nii * Njj + i * Njj + j) * nmom + m]
+          = host_mf[((int64_t)lt * nmom + m) * Nii * Njj + i * Njj + j];
+  }
+  grid->GlobalSumVector(global_mf.data(), (int64_t)nt_global * Nii * Njj * nmom);
+
+  for (int gt = 0; gt < nt_global; gt++)
+  for (int i  = 0; i  < Nii;      i++)
+  for (int j  = 0; j  < Njj;      j++)
+  for (int m  = 0; m  < nmom;     m++)
+    result(gt, i, j, m) =
+        global_mf[((int64_t)gt * Nii * Njj + i * Njj + j) * nmom + m];
 }
 
 // "A-slash" field w_i(x)^dag * i * A_mu * gamma_mu * v_j(x)
@@ -1976,9 +2173,9 @@ public:
 
   // ----------------------------------------------------------
   // compute: GPU extended meson field for one (type, gamma pair).
-  //   left   — original left vectors (conjugated during packing)
-  //   loop   — pre-built loop propagator (from LoopPropagator)
-  //   result[t][i][j] — rank-3 Eigen tensor (nt x N_i x N_j)
+  //   left   - original left vectors (conjugated during packing)
+  //   loop   - pre-built loop propagator (from LoopPropagator)
+  //   result[t][i][j] - rank-3 Eigen tensor (nt x N_i x N_j)
   // ----------------------------------------------------------
   template <typename TensorType>
   static void compute(
@@ -2057,7 +2254,7 @@ public:
 
   // ----------------------------------------------------------
   // ifOrthog=0: spatial-temporal pairs (x,t),(y,t),(z,t)
-  //             → G[0..2] anti-Hermitian, Sigma = SigmaXT,SigmaYT,SigmaZT
+  //             -> G[0..2] anti-Hermitian, Sigma = SigmaXT,SigmaYT,SigmaZT
   // ----------------------------------------------------------
   static void CMOContraction0(std::vector<GaugeMat> &G,
                                Vector<Gamma::Algebra> &Sigma,
@@ -2084,7 +2281,7 @@ public:
 
   // ----------------------------------------------------------
   // ifOrthog=1: spatial-spatial pairs (x,y),(x,z),(y,z)
-  //             → G[0..2] anti-Hermitian, Sigma = SigmaXY,SigmaXZ,SigmaYZ
+  //             -> G[0..2] anti-Hermitian, Sigma = SigmaXY,SigmaXZ,SigmaYZ
   // ----------------------------------------------------------
   static void CMOContraction1(std::vector<GaugeMat> &G,
                                Vector<Gamma::Algebra> &Sigma,
@@ -2113,7 +2310,7 @@ public:
   // GPU kernel: for each right vector accumulate
   //   loopRight(x) = sum_munu G[munu](x)*(parity?G5:1)*Gamma(Sigma[munu])*right(x)
   // G (colour) and Sigma (spin) are kept separate; all temporaries
-  // are per-thread register SpinColourVectors — no PropagatorField.
+  // are per-thread register SpinColourVectors - no PropagatorField.
   // ----------------------------------------------------------
   static void CMOContractRight(FermionField &loopRight,
                                 const std::vector<GaugeMat> &G,
@@ -2168,8 +2365,8 @@ public:
 
   // ----------------------------------------------------------
   // compute: GPU CMO field for one (ifOrthog, parity) pair.
-  //   No blocking — processes all N_i x N_j vectors at once.
-  //   result[t][i][j] — rank-3 Eigen tensor (nt x N_i x N_j)
+  //   No blocking - processes all N_i x N_j vectors at once.
+  //   result[t][i][j] - rank-3 Eigen tensor (nt x N_i x N_j)
   // ----------------------------------------------------------
   template <typename TensorType>
   static void compute(

@@ -36,8 +36,8 @@ NAMESPACE_BEGIN(Grid);
   contractions with a batched GEMM over local time slices, enabling GPU offload.
 
   Given:
-    leftv[N_i][osite]    — conjugated left SpinColourVectors (SIMD-packed)
-    loopRight[N_j][osite]— type-contracted right SpinColourVectors (SIMD-packed)
+    leftv[N_i][osite]    - conjugated left SpinColourVectors (SIMD-packed)
+    loopRight[N_j][osite]- type-contracted right SpinColourVectors (SIMD-packed)
 
   Computes:
     EMF[i,j,t] = sum_{x,s,c} leftv[i][x,t,s,c] * loopRight[j][x,t,s,c]
@@ -45,14 +45,13 @@ NAMESPACE_BEGIN(Grid);
   via batched GEMM over nt local time slices, then GlobalSumVector across MPI.
 
   Memory layout (all C row-major):
-    W_buf  [nt][N_i][nxyz*Nsc]  — W[t][i][x*Nsc+sc]  = leftv[i] at (x,t)
-    LR_buf [nt][N_j][nxyz*Nsc]  — LR[t][j][x*Nsc+sc] = loopRight[j] at (x,t)
-    EMF_buf[nt][N_j][N_i]       — column-major result; EMF[i,j,t] = EMF_buf[t][j][i]
+    W_buf  [nt][N_i][nxyz*Nsc]  - W[t][i][x*Nsc+sc]  = leftv[i] at (x,t)
+    LR_buf [nt][N_j][nxyz*Nsc]  - LR[t][j][x*Nsc+sc] = loopRight[j] at (x,t)
+    EMF_buf[nt][N_j][N_i]       - column-major result; EMF[i,j,t] = EMF_buf[t][j][i]
 
   BLAS call (column-major, OP_T on A so A is read as W[i][k]):
-    C = A^T * B  where A=W[N_i×K C-row], B=LR[N_j×K C-row], C=[N_j×N_i C-row]
-    → C[i,j] = sum_k W[i][k] * LR[j][k] = EMF[i,j] ✓
-*/
+    C = A^T * B  where A=W[N_ixK C-row], B=LR[N_jxK C-row], C=[N_jxN_i C-row]
+    -> C[i,j] = sum_k W[i][k] * LR[j][k] = EMF[i,j]*/
 template<class vobj>
 class A2ASpatialSum
 {
@@ -180,13 +179,12 @@ public:
 
 public:
 
-  // Batched GEMM + MPI reduction → result[nt_global][N_i][N_j]
+  // Batched GEMM + MPI reduction -> result[nt_global][N_i][N_j]
   //
   // BLAS (column-major, OP_T on A):
-  //   C[N_j×N_i] = A^T[N_i×K] * B[N_j×K]    with K=nxyz*Nsc
+  //   C[N_jxN_i] = A^T[N_ixK] * B[N_jxK]    with K=nxyz*Nsc
   //   reading A as C row-major [N_i][K] and B as C row-major [N_j][K]
-  //   → C[i,j] = sum_k W[i,k] * LR[j,k] = EMF[i,j] ✓
-  void Sum(Eigen::Tensor<ComplexD, 3> &result)
+  //   -> C[i,j] = sum_k W[i,k] * LR[j,k] = EMF[i,j]  void Sum(Eigen::Tensor<ComplexD, 3> &result)
   {
     GridBLAS BLAS;
 
@@ -293,7 +291,7 @@ public:
     });
   }
 
-  // Multiply LR_buf by conj(phase_buf[l_xyz]) — undoes ApplyPhaseRight exactly.
+  // Multiply LR_buf by conj(phase_buf[l_xyz]) - undoes ApplyPhaseRight exactly.
   void RestorePhaseRight(const deviceVector<scalar> &phase_buf)
   {
     scalar       *LR  = &LR_buf[0];
@@ -313,111 +311,6 @@ public:
     });
   }
 
-  // Like Allocate, but splits each SpinColourVector into Ns spin rows.
-  // N_i = _Nii * Ns, N_j = _Njj * Ns, Nsc = Nc = 3.
-  // GEMM output [nt, Nii*Ns, Njj*Ns] enables post-GEMM gamma trace over all gammas.
-  void AllocateSpin(int _Nii, int _Njj, GridBase *_grid)
-  {
-    const int Ns_qcd = 4;
-    grid  = _grid;
-    N_i   = _Nii * Ns_qcd;
-    N_j   = _Njj * Ns_qcd;
-    Coordinate ldims = grid->LocalDimensions();
-    nt    = ldims[grid->Nd() - 1];
-    nxyz  = grid->lSites() / nt;
-    int Nsc_full = sizeof(sobj) / sizeof(scalar); // = 12 for SpinColourVector
-    Nsc   = Nsc_full / Ns_qcd;                   // = 3 = Nc
-
-    W_buf.resize(nt * N_i * nxyz * Nsc);
-    LR_buf.resize(nt * N_j * nxyz * Nsc);
-    EMF_buf.resize(nt * N_j * N_i);
-
-    W_ptrs.resize(nt);
-    LR_ptrs.resize(nt);
-    EMF_ptrs.resize(nt);
-    scalar *Wh   = &W_buf[0];
-    scalar *LRh  = &LR_buf[0];
-    scalar *EMFh = &EMF_buf[0];
-    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-    for (int t = 0; t < nt; t++) {
-      acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
-      acceleratorPut(LR_ptrs[t],  LRh  + t * lN_j * lnxyz * lNsc);
-      acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
-    }
-  }
-
-  void PackLeftConjSpin(const std::vector<Lattice<vobj>> &left, int start = 0, int count = -1)
-  {
-    const int Ns_qcd = 4;
-    if (count < 0) count = (int)left.size();
-    GRID_ASSERT(start + count <= (int)left.size());
-    GRID_ASSERT(count * Ns_qcd == N_i);
-    PackVectorsSpin<true>(left, &W_buf[0], count, start);
-  }
-
-  void PackRightSpin(const std::vector<Lattice<vobj>> &right, int start = 0, int count = -1)
-  {
-    const int Ns_qcd = 4;
-    if (count < 0) count = (int)right.size();
-    GRID_ASSERT(start + count <= (int)right.size());
-    GRID_ASSERT(count * Ns_qcd == N_j);
-    PackVectorsSpin<false>(right, &LR_buf[0], count, start);
-  }
-
-  // Pack N spin-colour vectors from vecs[start..start+N-1] into buf[nt][N*Ns][nxyz*Nc].
-  // Mode n, spin s1 → row (n*Ns + s1); color elements indexed by l_xyz*Nc + c.
-  // DoConj=true conjugates each element during extraction (for PackLeftConjSpin).
-  template<bool DoConj = false>
-  void PackVectorsSpin(const std::vector<Lattice<vobj>> &vecs, scalar *buf, int N, int start = 0)
-  {
-    const int Ns_qcd = 4;
-    int nd     = grid->_ndimension;
-    int osites = grid->oSites();
-    int Nsimd  = vobj::Nsimd();
-    int lN_tot = N * Ns_qcd;   // total rows in buf per timeslice (= N_i or N_j)
-    int lNc    = Nsc;          // = Nc = 3, set by AllocateSpin
-    int lnxyz  = nxyz;
-    Coordinate rdimensions = grid->_rdimensions;
-    Coordinate ldims       = grid->LocalDimensions();
-    Coordinate simd        = grid->_simd_layout;
-
-    for (int n = 0; n < N; n++) {
-      autoView(src_v, vecs[start + n], AcceleratorRead);
-      accelerator_for(sf, osites, Nsimd, {
-#ifdef GRID_SIMT
-        {
-          int lane = acceleratorSIMTlane(Nsimd);
-#else
-          for (int lane = 0; lane < Nsimd; lane++) {
-#endif
-          Coordinate icoor(nd), ocoor(nd), lcoor(nd);
-          Lexicographic::CoorFromIndex(icoor, lane, simd);
-          Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
-          for (int d = 0; d < nd; d++)
-            lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
-
-          int     l_t = lcoor[nd - 1];
-          Coordinate xyz_coor = lcoor;
-          xyz_coor[nd - 1] = 0;
-          int64_t l_xyz;
-          Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
-
-          sobj    data   = extractLane(lane, src_v[sf]);
-          if constexpr (DoConj) data = conjugate(data);
-          scalar *data_s = (scalar *)&data;
-
-          for (int s1 = 0; s1 < Ns_qcd; s1++) {
-            int64_t row  = (int64_t)n * Ns_qcd + s1;
-            int64_t base = (int64_t)l_t * lN_tot * lnxyz * lNc
-                         + row           * lnxyz  * lNc
-                         + l_xyz         * lNc;
-            for (int c = 0; c < lNc; c++)
-              buf[base + c] = data_s[s1 * lNc + c];
-          }
-        }
-      });
-    }
-  }
 };
 
 NAMESPACE_END(Grid);
