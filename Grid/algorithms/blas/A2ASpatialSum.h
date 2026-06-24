@@ -184,7 +184,8 @@ public:
   // BLAS (column-major, OP_T on A):
   //   C[N_jxN_i] = A^T[N_ixK] * B[N_jxK]    with K=nxyz*Nsc
   //   reading A as C row-major [N_i][K] and B as C row-major [N_j][K]
-  //   -> C[i,j] = sum_k W[i,k] * LR[j,k] = EMF[i,j]  void Sum(Eigen::Tensor<ComplexD, 3> &result)
+  //   -> C[i,j] = sum_k W[i,k] * LR[j,k] = EMF[i,j]
+  void Sum(Eigen::Tensor<ComplexD, 3> &result)
   {
     GridBLAS BLAS;
 

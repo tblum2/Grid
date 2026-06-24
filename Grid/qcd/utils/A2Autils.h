@@ -71,7 +71,7 @@ public:
 			 const FermionField *rhs_vj,
 			 std::vector<Gamma::Algebra> gammas,
 			 const std::vector<ComplexField > &mom,
-			 int orthogdim, double *timer);
+			 int orthogdim, double *timer)
   {
     MesonField(mat, lhs_wi, rhs_vj, gammas, mom, orthogdim);
   }
@@ -320,7 +320,6 @@ void A2Autils<FImpl>::MesonField(TensorType &mat,
 }
 
 template <class FImpl>
-template <class FImpl>
 void A2Autils<FImpl>::PhaseContractRight(FermionField       &out,
                                           const ComplexField &phase,
                                           Gamma::Algebra      g,
@@ -395,7 +394,7 @@ void A2Autils<FImpl>::SpinColorTrace(
     sobj gamma_lr      = Gamma(lga) * lr_site;
     scalar_type *glr_s = (scalar_type *)&gamma_lr;
 
-    scalar_type result = Zero();
+    scalar_type result = 0;
     for (int sc = 0; sc < lNsc; sc++)
       result += W[w_base + sc] * glr_s[sc];
 
