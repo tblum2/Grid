@@ -324,42 +324,22 @@ public:
   }
 
   // Multiply LR_buf[t][j][l_xyz*Nsc + sc] by phase_buf[l_xyz] for all (t, j, sc).
-  // One thread per (j, l_xyz); inner loop over (t, sc) is sequential.
+  // Nsc lanes per (j, l_xyz) pair: adjacent lanes access consecutive sc values -> stride-1 coalesced.
   void ApplyPhaseRight(const deviceVector<scalar> &phase_buf)
   {
     scalar       *LR  = &LR_buf[0];
     const scalar *ph  = &phase_buf[0];
     int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnt = nt;
-    accelerator_for(idx, (size_t)(lN_j * lnxyz), 1, {
+    accelerator_for(idx, (size_t)(lN_j * lnxyz), lNsc, {
       int    j     = idx / lnxyz;
       int    l_xyz = idx % lnxyz;
+      int    sc    = acceleratorSIMTlane(lNsc);
       scalar ph_val = ph[l_xyz];
       for (int t = 0; t < lnt; t++) {
         int64_t base = (int64_t)t * lN_j * lnxyz * lNsc
                      + (int64_t)j * lnxyz * lNsc
                      + l_xyz * lNsc;
-        for (int sc = 0; sc < lNsc; sc++)
-          LR[base + sc] *= ph_val;
-      }
-    });
-  }
-
-  // Multiply LR_buf by conj(phase_buf[l_xyz]) - undoes ApplyPhaseRight exactly.
-  void RestorePhaseRight(const deviceVector<scalar> &phase_buf)
-  {
-    scalar       *LR  = &LR_buf[0];
-    const scalar *ph  = &phase_buf[0];
-    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnt = nt;
-    accelerator_for(idx, (size_t)(lN_j * lnxyz), 1, {
-      int    j     = idx / lnxyz;
-      int    l_xyz = idx % lnxyz;
-      scalar ph_val = Grid::conjugate(ph[l_xyz]);
-      for (int t = 0; t < lnt; t++) {
-        int64_t base = (int64_t)t * lN_j * lnxyz * lNsc
-                     + (int64_t)j * lnxyz * lNsc
-                     + l_xyz * lNsc;
-        for (int sc = 0; sc < lNsc; sc++)
-          LR[base + sc] *= ph_val;
+        LR[base + sc] *= ph_val;
       }
     });
   }
