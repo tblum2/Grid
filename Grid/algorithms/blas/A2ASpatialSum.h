@@ -225,7 +225,14 @@ public:
   //   C[N_jxN_i] = A^T[N_ixK] * B[N_jxK]    with K=nxyz*Nsc
   //   reading A as C row-major [N_i][K] and B as C row-major [N_j][K]
   //   -> C[i,j] = sum_k W[i,k] * LR[j,k] = EMF[i,j]
-  void Sum(Eigen::Tensor<ComplexD, 3> &result)
+  //
+  // result's layout defaults to ColMajor (Eigen::Tensor's own default) so
+  // every existing caller is unaffected; callers whose consumer expects
+  // j-fastest (e.g. writing into a RowMajor A2AMatrixSet for HDF5) should
+  // pass a RowMajor result -- this loop's writes are then contiguous
+  // instead of striding by nt_global*N_i per j, with no code change here.
+  template <int Layout = Eigen::ColMajor>
+  void Sum(Eigen::Tensor<ComplexD, 3, Layout> &result)
   {
     GridBLAS BLAS;
 
@@ -249,19 +256,27 @@ public:
                               nt * N_j * N_i * sizeof(scalar));
 
     // EMF_buf[t][j*N_i + i] = EMF[i,j] for local t
+    // Both loops here are pure host-side CPU work (after the single device->
+    // host copy above and before/after the MPI reduction respectively); no
+    // GPU involvement, so plain OpenMP threading applies. Loop nest must
+    // stay perfectly nested for collapse(3) to be valid (nothing between the
+    // three for-statements), matching the thread_for_collapse precedent at
+    // A2Autils.h:1503 -- derived indices are computed inline in the
+    // innermost body rather than declared between loop levels.
     std::vector<scalar> global_emf(nt_global * N_i * N_j, scalar(0.0));
-    for (int lt = 0; lt < nt; lt++) {
-      int gt = lt + lt_start;
-      for (int i = 0; i < N_i; i++)
-      for (int j = 0; j < N_j; j++)
-        global_emf[gt * N_i * N_j + i * N_j + j] = host_emf[lt * N_j * N_i + j * N_i + i];
-    }
+    thread_for_collapse(3, lt, nt, {
+        for (int i = 0; i < N_i; i++)
+        for (int j = 0; j < N_j; j++)
+          global_emf[((int)lt + lt_start) * N_i * N_j + i * N_j + j]
+              = host_emf[(int)lt * N_j * N_i + j * N_i + i];
+    });
     grid->GlobalSumVector(global_emf.data(), nt_global * N_i * N_j);
 
-    for (int gt = 0; gt < nt_global; gt++)
-    for (int i  = 0; i  < N_i;      i++)
-    for (int j  = 0; j  < N_j;      j++)
-      result(gt, i, j) = global_emf[gt * N_i * N_j + i * N_j + j];
+    thread_for_collapse(3, gt, nt_global, {
+        for (int i = 0; i < N_i; i++)
+        for (int j = 0; j < N_j; j++)
+          result((int)gt, i, j) = global_emf[(int)gt * N_i * N_j + i * N_j + j];
+    });
   }
 
   // Unpack a ComplexField phase into a flat array of one scalar per spatial site l_xyz.
