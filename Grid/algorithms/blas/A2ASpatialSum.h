@@ -231,12 +231,20 @@ public:
   // j-fastest (e.g. writing into a RowMajor A2AMatrixSet for HDF5) should
   // pass a RowMajor result -- this loop's writes are then contiguous
   // instead of striding by nt_global*N_i per j, with no code change here.
+  // timings[0]: GEMM + synchronise
+  // timings[1]: device->host copy
+  // timings[2]: transpose (host_emf -> global_emf)
+  // timings[3]: GlobalSumVector
+  // timings[4]: transpose (global_emf -> result)
   template <int Layout = Eigen::ColMajor>
-  void Sum(Eigen::Tensor<ComplexD, 3, Layout> &result)
+  void Sum(Eigen::Tensor<ComplexD, 3, Layout> &result,
+           std::array<double, 5> *timings = nullptr)
   {
     GridBLAS BLAS;
+    double dt;
 
     int K = nxyz * Nsc;
+    dt = -usecond();
     BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
                      N_i, N_j, K,
                      scalar(1.0),
@@ -245,38 +253,46 @@ public:
                      scalar(0.0),
                      EMF_ptrs);
     BLAS.synchronise();
+    dt += usecond();
+    if (timings) (*timings)[0] += dt;
 
-    // Copy from device and distribute into global-t layout
     int nt_global = result.dimension(0);
     int nd        = grid->Nd();
     int lt_start  = grid->LocalStarts()[nd - 1];
 
     std::vector<scalar> host_emf(nt * N_j * N_i);
+    dt = -usecond();
     acceleratorCopyFromDevice(&EMF_buf[0], host_emf.data(),
                               nt * N_j * N_i * sizeof(scalar));
+    dt += usecond();
+    if (timings) (*timings)[1] += dt;
 
-    // EMF_buf[t][j*N_i + i] = EMF[i,j] for local t
-    // Both loops here are pure host-side CPU work (after the single device->
-    // host copy above and before/after the MPI reduction respectively); no
-    // GPU involvement, so plain OpenMP threading applies. Loop nest must
-    // stay perfectly nested for collapse(3) to be valid (nothing between the
-    // three for-statements), matching the thread_for_collapse precedent at
-    // A2Autils.h:1503 -- derived indices are computed inline in the
-    // innermost body rather than declared between loop levels.
+    // Both loops are pure host-side CPU work; loop nests are perfectly nested
+    // for collapse(3) following the thread_for_collapse precedent at A2Autils.h:1503.
     std::vector<scalar> global_emf(nt_global * N_i * N_j, scalar(0.0));
+    dt = -usecond();
     thread_for_collapse(3, lt, nt, {
         for (int i = 0; i < N_i; i++)
         for (int j = 0; j < N_j; j++)
           global_emf[((int)lt + lt_start) * N_i * N_j + i * N_j + j]
               = host_emf[(int)lt * N_j * N_i + j * N_i + i];
     });
-    grid->GlobalSumVector(global_emf.data(), nt_global * N_i * N_j);
+    dt += usecond();
+    if (timings) (*timings)[2] += dt;
 
+    dt = -usecond();
+    grid->GlobalSumVector(global_emf.data(), nt_global * N_i * N_j);
+    dt += usecond();
+    if (timings) (*timings)[3] += dt;
+
+    dt = -usecond();
     thread_for_collapse(3, gt, nt_global, {
         for (int i = 0; i < N_i; i++)
         for (int j = 0; j < N_j; j++)
           result((int)gt, i, j) = global_emf[(int)gt * N_i * N_j + i * N_j + j];
     });
+    dt += usecond();
+    if (timings) (*timings)[4] += dt;
   }
 
   // Unpack a ComplexField phase into a flat array of one scalar per spatial site l_xyz.
