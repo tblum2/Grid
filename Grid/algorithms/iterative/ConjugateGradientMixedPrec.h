@@ -41,6 +41,7 @@ NAMESPACE_BEGIN(Grid);
     RealD   InnerTolerance; //Initial tolerance for inner CG. Defaults to Tolerance but can be changed
     Integer MaxInnerIterations;
     Integer MaxOuterIterations;
+    bool ifCGD;
     GridBase* SinglePrecGrid; //Grid for single-precision fields
     RealD OuterLoopNormMult; //Stop the outer loop and move to a final double prec solve when the residual is OuterLoopNormMult * Tolerance
     LinearOperatorBase<FieldF> &Linop_f;
@@ -48,7 +49,8 @@ NAMESPACE_BEGIN(Grid);
 
     Integer TotalInnerIterations; //Number of inner CG iterations
     Integer TotalOuterIterations; //Number of restarts
-    Integer TotalFinalStepIterations; //Number of CG iterations in final patch-up step
+    Integer TotalFinalStepIterations = 0; //Number of CG iterations in final patch-up step (based on ifCGD bool)
+    
     RealD TrueResidual;
 
     //Option to speed up *inner single precision* solves using a LinearFunction that produces a guess
@@ -59,8 +61,8 @@ NAMESPACE_BEGIN(Grid);
 				    Integer maxouterit, 
 				    GridBase* _sp_grid, 
 				    LinearOperatorBase<FieldF> &_Linop_f, 
-				    LinearOperatorBase<FieldD> &_Linop_d) :
-      Linop_f(_Linop_f), Linop_d(_Linop_d),
+				    LinearOperatorBase<FieldD> &_Linop_d, bool ifcg_d = true) :
+      Linop_f(_Linop_f), Linop_d(_Linop_d), ifCGD(ifcg_d),
       Tolerance(tol), InnerTolerance(tol), MaxInnerIterations(maxinnerit), MaxOuterIterations(maxouterit), SinglePrecGrid(_sp_grid),
       OuterLoopNormMult(100.), guesser(NULL){ };
 
@@ -116,7 +118,7 @@ NAMESPACE_BEGIN(Grid);
       //Compute double precision rsd and also new RHS vector.
       Linop_d.HermOp(sol_d, tmp_d);
       RealD norm = axpy_norm(src_d, -1., tmp_d, src_d_in); //src_d is residual vector
-      std::cout<<GridLogMessage<<" rsd norm "<<norm<<std::endl;
+      //std::cout<<GridLogMessage<<" rsd norm "<<norm<<std::endl;
       std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradient: Outer iteration " <<outer_iter<<" residual "<< norm<< " target "<< stop<<std::endl;
 
       if(norm < OuterLoopNormMult * stop){
@@ -124,6 +126,7 @@ NAMESPACE_BEGIN(Grid);
 	break;
       }
       while(norm * inner_tol * inner_tol < stop*1.01) inner_tol *= 2;  // inner_tol = sqrt(stop/norm) ??
+      //while(norm * inner_tol * inner_tol < stop) inner_tol *= 2;  // inner_tol = sqrt(stop/norm) ??
 
       PrecChangeTimer.Start();
       precisionChange(src_f, src_d, pc_wk_dp_to_sp);
@@ -152,12 +155,16 @@ NAMESPACE_BEGIN(Grid);
     }
     
     //Final trial CG
-    std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradient: Starting final patch-up double-precision solve"<<std::endl;
+    if(ifCGD){
+      std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradient: Starting final patch-up double-precision solve"<<std::endl;
     
-    ConjugateGradient<FieldD> CG_d(Tolerance, MaxInnerIterations);
-    CG_d(Linop_d, src_d_in, sol_d);
-    TotalFinalStepIterations = CG_d.IterationsToComplete;
-    TrueResidual = CG_d.TrueResidual;
+      ConjugateGradient<FieldD> CG_d(Tolerance, MaxInnerIterations);
+      CG_d(Linop_d, src_d_in, sol_d);
+      TotalFinalStepIterations = CG_d.IterationsToComplete;
+      TrueResidual = CG_d.TrueResidual;
+    } else {
+      std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradient: Skipping final patch-up double precision solve" << std::endl;
+    }
 
     TotalTimer.Stop();
     std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradient: Inner CG iterations " << TotalInnerIterations << " Restarts " << TotalOuterIterations << " Final CG iterations " << TotalFinalStepIterations << std::endl;
