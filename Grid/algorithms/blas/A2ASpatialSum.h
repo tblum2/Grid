@@ -7,6 +7,7 @@
     Copyright (C) 2025
 
 Author: Peter Boyle <pboyle@bnl.gov>
+Author: Jonas Hildebrand <jonas.hildebrand@uconn.edu>
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
