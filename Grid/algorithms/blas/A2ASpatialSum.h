@@ -631,15 +631,17 @@ public:
   // one call -- matching FMF's own cache-tile message shape exactly --
   // instead of one call covering the whole N_i x nmom*N_j block.
   //
-  // result[nt_global][N_i][nmom][N_j] -- same dimension order as
-  // SumAllMomenta, nmom before N_j, so a RowMajor result's fastest
-  // dimension (N_j) matches this function's own scatter loop below (jjj
-  // innermost), keeping the write into result contiguous. tile itself stays
-  // m-fastest (unchanged from the fill step above), so the read side of the
-  // scatter becomes stride-nmom instead -- but tile is cacheBlock-sized and
-  // stays cache-resident regardless of access pattern, unlike result, so
-  // that's the right side to make non-contiguous if one of the two has to
-  // be. timings[] slots match Sum()'s.
+  // result[nt_global][N_i][N_j][nmom] -- deliberately the OPPOSITE dimension
+  // order from SumAllMomenta (nmom last, not before N_j). Unlike
+  // SumAllMomenta, this function stages through its own tile buffer (laid
+  // out m-fastest, see the fill step below) instead of reading straight out
+  // of the GEMM's own col=m*N_j+j-ordered output, so it isn't constrained
+  // by that layout -- tile's m-fastest storage and the scatter loop's
+  // m-innermost order already agree with each other, and with a RowMajor
+  // result[...][nmom] (m fastest there too), so both the read from tile and
+  // the write into result are contiguous simultaneously. Do not "align"
+  // this with SumAllMomenta's layout -- they need different ones.
+  // timings[] slots match Sum()'s.
   template <int Layout = Eigen::ColMajor>
   void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
                                  int cacheBlock,
@@ -704,9 +706,9 @@ public:
         dt = -usecond();
         thread_for_collapse(4, gt, nt_global, {
             for (int iii = 0; iii < Niii; iii++)
-            for (int m = 0; m < lnmom; m++)
             for (int jjj = 0; jjj < Njjj; jjj++)
-              result((int)gt, ii + iii, m, jj + jjj)
+            for (int m = 0; m < lnmom; m++)
+              result((int)gt, ii + iii, jj + jjj, m)
                   = tile[((int)gt * Niii * Njjj + iii * Njjj + jjj) * lnmom + m];
         });
         dt += usecond();
