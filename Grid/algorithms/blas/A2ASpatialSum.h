@@ -555,7 +555,12 @@ public:
   // GEMM and one GlobalSumVector for the whole block, covering every
   // momentum, instead of one pair per momentum via Sum().
   //
-  // result[nt_global][N_i][N_j][nmom]; timings[] slots match Sum()'s.
+  // result[nt_global][N_i][nmom][N_j] -- nmom before N_j (not after) so that
+  // with a RowMajor result, the fastest dimension (N_j) lines up with col's
+  // own fastest sub-index (col=m*N_j+j, j fastest) and global_emf's own
+  // layout (col fastest); the final transpose becomes a straight contiguous
+  // copy on both sides instead of a stride-nmom scatter into result.
+  // timings[] slots match Sum()'s.
   template <int Layout = Eigen::ColMajor>
   void SumAllMomenta(Eigen::Tensor<ComplexD, 4, Layout> &result,
                       std::array<double, 5> *timings = nullptr)
@@ -611,7 +616,7 @@ public:
         for (int col = 0; col < Nwide; col++) {
           int m = col / N_j;
           int j = col % N_j;
-          result((int)gt, i, j, m) = global_emf[(int)gt * N_i * Nwide + i * Nwide + col];
+          result((int)gt, i, m, j) = global_emf[(int)gt * N_i * Nwide + i * Nwide + col];
         }
     });
     dt += usecond();
@@ -626,7 +631,15 @@ public:
   // one call -- matching FMF's own cache-tile message shape exactly --
   // instead of one call covering the whole N_i x nmom*N_j block.
   //
-  // result[nt_global][N_i][N_j][nmom]; timings[] slots match Sum()'s.
+  // result[nt_global][N_i][nmom][N_j] -- same dimension order as
+  // SumAllMomenta, nmom before N_j, so a RowMajor result's fastest
+  // dimension (N_j) matches this function's own scatter loop below (jjj
+  // innermost), keeping the write into result contiguous. tile itself stays
+  // m-fastest (unchanged from the fill step above), so the read side of the
+  // scatter becomes stride-nmom instead -- but tile is cacheBlock-sized and
+  // stays cache-resident regardless of access pattern, unlike result, so
+  // that's the right side to make non-contiguous if one of the two has to
+  // be. timings[] slots match Sum()'s.
   template <int Layout = Eigen::ColMajor>
   void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
                                  int cacheBlock,
@@ -691,9 +704,9 @@ public:
         dt = -usecond();
         thread_for_collapse(4, gt, nt_global, {
             for (int iii = 0; iii < Niii; iii++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
             for (int m = 0; m < lnmom; m++)
-              result((int)gt, ii + iii, jj + jjj, m)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+              result((int)gt, ii + iii, m, jj + jjj)
                   = tile[((int)gt * Niii * Njjj + iii * Njjj + jjj) * lnmom + m];
         });
         dt += usecond();
