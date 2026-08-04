@@ -360,6 +360,88 @@ public:
     if (timings) (*timings)[4] += dt;
   }
 
+  // Same GEMM as Sum() (M=N_i, N=N_j, K=nxyz*Nsc, run once at full block
+  // size for GEMM efficiency), but GlobalSumVector is decoupled from the
+  // GEMM tile: the local result is sliced into cacheBlock x cacheBlock
+  // (i,j) tiles -- each spanning the full nt_global, same as FMF's own
+  // cache-tile loop -- and reduced with one small GlobalSumVector call per
+  // tile instead of one call covering the whole N_i x N_j block. GEMM size
+  // and GSV size are therefore independently tunable: cacheBlock controls
+  // only collective granularity, never the GEMM shape.
+  //
+  // timings[0]: GEMM + synchronise
+  // timings[1]: device->host copy
+  // timings[2]: local fill (host_emf -> per-tile buffer), summed over tiles
+  // timings[3]: GlobalSumVector, summed over tiles
+  // timings[4]: scatter (per-tile buffer -> result), summed over tiles
+  template <int Layout = Eigen::ColMajor>
+  void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
+                       int cacheBlock,
+                       std::array<double, 5> *timings = nullptr)
+  {
+    GridBLAS BLAS;
+    double dt;
+
+    int K = nxyz * Nsc;
+    dt = -usecond();
+    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
+                     N_i, N_j, K,
+                     scalar(1.0),
+                     W_ptrs,
+                     LR_ptrs,
+                     scalar(0.0),
+                     EMF_ptrs);
+    BLAS.synchronise();
+    dt += usecond();
+    if (timings) (*timings)[0] += dt;
+
+    int nt_global = result.dimension(0);
+    int nd        = grid->Nd();
+    int lt_start  = grid->LocalStarts()[nd - 1];
+
+    std::vector<scalar> host_emf(nt * N_j * N_i);
+    dt = -usecond();
+    acceleratorCopyFromDevice(&EMF_buf[0], host_emf.data(),
+                              nt * N_j * N_i * sizeof(scalar));
+    dt += usecond();
+    if (timings) (*timings)[1] += dt;
+
+    for (int ii = 0; ii < N_i; ii += cacheBlock)
+    {
+      int Niii = std::min(N_i - ii, cacheBlock);
+      for (int jj = 0; jj < N_j; jj += cacheBlock)
+      {
+        int Njjj = std::min(N_j - jj, cacheBlock);
+
+        std::vector<scalar> tile((size_t)nt_global * Niii * Njjj, scalar(0.0));
+        dt = -usecond();
+        thread_for_collapse(3, lt, nt, {
+            for (int iii = 0; iii < Niii; iii++)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+              tile[((int)lt + lt_start) * Niii * Njjj + iii * Njjj + jjj]
+                  = host_emf[(int)lt * N_j * N_i + (jj + jjj) * N_i + (ii + iii)];
+        });
+        dt += usecond();
+        if (timings) (*timings)[2] += dt;
+
+        dt = -usecond();
+        grid->GlobalSumVector(tile.data(), (size_t)nt_global * Niii * Njjj);
+        dt += usecond();
+        if (timings) (*timings)[3] += dt;
+
+        dt = -usecond();
+        thread_for_collapse(3, gt, nt_global, {
+            for (int iii = 0; iii < Niii; iii++)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+              result((int)gt, ii + iii, jj + jjj)
+                  = tile[(int)gt * Niii * Njjj + iii * Njjj + jjj];
+        });
+        dt += usecond();
+        if (timings) (*timings)[4] += dt;
+      }
+    }
+  }
+
   // Unpack a ComplexField phase into a flat array of one scalar per spatial site l_xyz.
   // ph is assumed time-independent; all t-layers write the same value so redundant
   // writes across timeslices are safe.  Mirrors the PackVectors SIMD/SIMT extraction.
@@ -534,6 +616,90 @@ public:
     });
     dt += usecond();
     if (timings) (*timings)[4] += dt;
+  }
+
+  // Same GEMM as SumAllMomenta (M=N_i, N=nmom*N_j, K=nxyz*Nsc, momentum
+  // folded into the GEMM's wide dimension), but GlobalSumVector decoupled
+  // from the GEMM tile the same way SumCacheBlocked decouples it from
+  // Sum(): the local result is sliced into cacheBlock x cacheBlock (i,j)
+  // tiles, each still spanning the full nt_global and all nmom momenta in
+  // one call -- matching FMF's own cache-tile message shape exactly --
+  // instead of one call covering the whole N_i x nmom*N_j block.
+  //
+  // result[nt_global][N_i][N_j][nmom]; timings[] slots match Sum()'s.
+  template <int Layout = Eigen::ColMajor>
+  void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
+                                 int cacheBlock,
+                                 std::array<double, 5> *timings = nullptr)
+  {
+    GridBLAS BLAS;
+    double dt;
+
+    int K     = nxyz * Nsc;
+    int Nwide = nmom * N_j;
+
+    dt = -usecond();
+    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
+                     N_i, Nwide, K,
+                     scalar(1.0),
+                     W_ptrs,
+                     LR_mom_ptrs,
+                     scalar(0.0),
+                     EMF_mom_ptrs);
+    BLAS.synchronise();
+    dt += usecond();
+    if (timings) (*timings)[0] += dt;
+
+    int nt_global = result.dimension(0);
+    int nd        = grid->Nd();
+    int lt_start  = grid->LocalStarts()[nd - 1];
+
+    std::vector<scalar> host_emf((size_t)nt * Nwide * N_i);
+    dt = -usecond();
+    acceleratorCopyFromDevice(&EMF_mom_buf[0], host_emf.data(),
+                              (size_t)nt * Nwide * N_i * sizeof(scalar));
+    dt += usecond();
+    if (timings) (*timings)[1] += dt;
+
+    int lN_j = N_j, lnmom = nmom;
+    for (int ii = 0; ii < N_i; ii += cacheBlock)
+    {
+      int Niii = std::min(N_i - ii, cacheBlock);
+      for (int jj = 0; jj < N_j; jj += cacheBlock)
+      {
+        int Njjj = std::min(N_j - jj, cacheBlock);
+
+        std::vector<scalar> tile((size_t)nt_global * Niii * Njjj * nmom, scalar(0.0));
+        dt = -usecond();
+        thread_for_collapse(4, lt, nt, {
+            for (int iii = 0; iii < Niii; iii++)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+            for (int m = 0; m < lnmom; m++)
+              tile[(((int)lt + lt_start) * Niii * Njjj + iii * Njjj + jjj) * lnmom + m]
+                  = host_emf[(int)lt * (lnmom * lN_j) * N_i
+                             + (m * lN_j + (jj + jjj)) * N_i
+                             + (ii + iii)];
+        });
+        dt += usecond();
+        if (timings) (*timings)[2] += dt;
+
+        dt = -usecond();
+        grid->GlobalSumVector(tile.data(), (size_t)nt_global * Niii * Njjj * nmom);
+        dt += usecond();
+        if (timings) (*timings)[3] += dt;
+
+        dt = -usecond();
+        thread_for_collapse(4, gt, nt_global, {
+            for (int iii = 0; iii < Niii; iii++)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+            for (int m = 0; m < lnmom; m++)
+              result((int)gt, ii + iii, jj + jjj, m)
+                  = tile[((int)gt * Niii * Njjj + iii * Njjj + jjj) * lnmom + m];
+        });
+        dt += usecond();
+        if (timings) (*timings)[4] += dt;
+      }
+    }
   }
 
 };
