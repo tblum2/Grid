@@ -339,6 +339,71 @@ void CayleyFermion5D<Impl>::Mdag (const FermionField &psi, FermionField &chi)
   axpby (chi,1.0,1.0,chi,psi); 
 }
 
+// D^5_GDW D_-  (D_- applied on the right/source side instead of the left)
+//
+// D_- dresses each off-diagonal block of D^5_GDW using the D_- of the
+// NEIGHBOUR (column) index rather than the row index, and D_W must act on
+// the raw neighbour field before it is chirally projected -- the reverse
+// of the M5D-Meooe5D-M5D order used in M(). The diagonal block is
+// unaffected: D_+ and D_- are both polynomials in the same D_W, so
+// Dtilde_s * D_-,s = D_-,s^{-1} D_+,s D_-,s = D_+,s, same as in M().
+template<class Impl>
+void CayleyFermion5D<Impl>::MDminus (const FermionField &psi, FermionField &chi)
+{
+  int Ls = this->Ls;
+  FermionField Deta(psi.Grid());
+
+  // Deta = D_W psi, slice-wise, UNPROJECTED
+  this->DW(psi,Deta,DaggerNo);
+
+  // c_s-weighted piece, indexed by the NEIGHBOUR's s; corners pick up an
+  // extra minus sign relative to the bulk since their bare D^5_GDW
+  // coefficient is +mass, not -1.
+  std::vector<Coeff_t> diag = bs;
+  std::vector<Coeff_t> upper(Ls), lower(Ls);
+  for(int s=0;s<Ls;s++){
+    upper[s] = cs[(s+1)%Ls];
+    lower[s] = cs[(s+Ls-1)%Ls];
+  }
+  upper[Ls-1] = -mass_minus*cs[0];
+  lower[0]    = -mass_plus *cs[Ls-1];
+
+  M5D(Deta,Deta,chi,lower,diag,upper);
+
+  // D_- - independent piece: bare projector + mass corner, identical to M()'s tail
+  axpby(chi,1.0,1.0,chi,psi);
+  M5D(psi,chi);
+}
+
+// (D^5_GDW D_-)^dagger = D_-^dagger (D^5_GDW)^dagger
+//
+// Block-transposing MDminus shows the dagger has the SAME shape as M()
+// (project first with the row's own, conjugated c_s; then D_W^dagger;
+// then the bare M5Ddag tail) rather than Mdag()'s shape -- i.e. MDminus
+// mirrors Mdag()'s ordering and MDminusDag mirrors M()'s ordering.
+template<class Impl>
+void CayleyFermion5D<Impl>::MDminusDag (const FermionField &psi, FermionField &chi)
+{
+  int Ls = this->Ls;
+  FermionField Din(psi.Grid());
+
+  std::vector<Coeff_t> diag(Ls), upper(Ls), lower(Ls);
+  for(int s=0;s<Ls;s++){
+    diag[s]  = conjugate(bs[s]);
+    upper[s] = conjugate(cs[s]);
+    lower[s] = conjugate(cs[s]);
+  }
+  upper[Ls-1] = -mass_plus *conjugate(cs[Ls-1]);
+  lower[0]    = -mass_minus*conjugate(cs[0]);
+
+  M5Ddag(psi,psi,Din,lower,diag,upper);
+
+  this->DW(Din,chi,DaggerYes);
+
+  axpby(chi,1.0,1.0,chi,psi);
+  M5Ddag(psi,chi);
+}
+
 // half checkerboard operations
 template<class Impl>
 void CayleyFermion5D<Impl>::Meooe       (const FermionField &psi, FermionField &chi)

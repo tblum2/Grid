@@ -43,6 +43,10 @@ public:
   virtual void   M    (const FermionField &in, FermionField &out);
   virtual void   Mdag (const FermionField &in, FermionField &out);
 
+  // D^5_GDW D_-  and its dagger (D_- applied on the right instead of the left)
+  virtual void   MDminus    (const FermionField &in, FermionField &out);
+  virtual void   MDminusDag (const FermionField &in, FermionField &out);
+
   // half checkerboard operations
   virtual void   Meooe       (const FermionField &in, FermionField &out);
   virtual void   MeooeDag    (const FermionField &in, FermionField &out);
