@@ -823,13 +823,79 @@ void CayleyFermion5D<Impl>::ContractConservedCurrent( PropagatorField &q_in_1,
 
     if (s < Ls/2) q_out += sgn*C;
     else          q_out +=     C;
-    
+
   }
 
 }
 
+// Eq. (18): conserved current from the D_M D_- ("MDminus") propagator.
+// Mirrors WilsonFermion::ContractConservedCurrent's own gamma5(.)^dag gamma5
+// machinery term-for-term, applied per 5D slice and summed over s. q_in_1 is
+// pre-reflected in s (s -> Ls-1-s, no dagger/gamma5 applied here -- the
+// kernel below supplies gamma5(.)^dag gamma5 itself, exactly as it does for
+// Wilson's own q_in_1) so that calling with q_in_1=q_in_2=G reproduces
+// Eq. (18) directly.
 template <class Impl>
-void CayleyFermion5D<Impl>::SeqConservedCurrent(PropagatorField &q_in, 
+void CayleyFermion5D<Impl>::ContractMobiusConservedCurrent(PropagatorField &q_in_1,
+							     PropagatorField &q_in_2,
+							     PropagatorField &q_out,
+							     unsigned int mu)
+{
+  int Ls = this->Ls;
+  GridBase *UGrid = q_out.Grid();
+
+  Gamma g5(Gamma::Algebra::Gamma5);
+  Gamma::Algebra Gmu[] = {
+    Gamma::Algebra::GammaX,
+    Gamma::Algebra::GammaY,
+    Gamma::Algebra::GammaZ,
+    Gamma::Algebra::GammaT,
+  };
+  Gamma gmu(Gmu[mu]);
+
+  // H(x,s) = q_in_1(x, Ls-1-s): pure 5th-dimension reflection.
+  PropagatorField H(q_in_1.Grid());
+  for (int s = 0; s < Ls; s++) {
+    PropagatorField slice(UGrid);
+    ExtractSlice(slice, q_in_1, s, 0);
+    InsertSlice(slice, H, Ls - 1 - s, 0);
+  }
+
+  q_out = Zero();
+  PropagatorField L_s(UGrid), R_s(UGrid);
+  PropagatorField g5Lg5(UGrid), tmp_shifted(UGrid), R(UGrid), gmuR(UGrid), term(UGrid);
+
+  for (int s = 0; s < Ls; s++) {
+    ExtractSlice(L_s, H,     s, 0);   // = q_in_1(x, Ls-1-s)
+    ExtractSlice(R_s, q_in_2, s, 0);  // = q_in_2(x, s)
+
+    g5Lg5 = g5*L_s*g5;
+    tmp_shifted = Cshift(R_s, mu, 1);
+    Impl::multLinkField(R, this->Umu, tmp_shifted, mu);
+    gmuR = gmu*R;
+
+    term  = adj(g5Lg5)*R;
+    term -= adj(g5Lg5)*gmuR;
+
+    tmp_shifted = Cshift(L_s, mu, 1);
+    Impl::multLinkField(g5Lg5, this->Umu, tmp_shifted, mu);
+    g5Lg5 = g5*g5Lg5*g5;
+    R = R_s;
+    gmuR = gmu*R;
+
+    term -= adj(g5Lg5)*R;
+    term -= adj(g5Lg5)*gmuR;
+
+    // (b+c) prefactor from Eq. (7)/(10), omitted from Eq. (18) itself.
+    // Using the per-slice bs[s]+cs[s] here reduces to the constant (b+c)
+    // for plain Mobius (bs[s],cs[s] both constant across s).
+    RealD bpc = real(this->bs[s]) + real(this->cs[s]);
+    q_out += bpc*term;
+  }
+}
+
+template <class Impl>
+void CayleyFermion5D<Impl>::SeqConservedCurrent(PropagatorField &q_in,
                                                 PropagatorField &q_out,
                                                 PropagatorField &phys_src,
                                                 Current curr_type, 

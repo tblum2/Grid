@@ -178,8 +178,21 @@ public:
 				PropagatorField &q_in_2,
 				PropagatorField &q_out,
 				PropagatorField &phys_src,
-				Current curr_type, 
+				Current curr_type,
 				unsigned int mu);
+
+  // Eq. (18) of the Mobius-conserved-currents notes: conserved current
+  // contraction built from the D_M D_- ("MDminus") propagator, following
+  // WilsonFermion::ContractConservedCurrent's structure directly rather
+  // than the unfactored-action current above. q_in_1 and q_in_2 are
+  // typically the SAME 5D propagator G = (D_M D_-)^{-1}(.,y); q_in_1 is
+  // reflected in s internally (s -> Ls-1-s) before reuse of the Wilson
+  // kernel's own gamma5(.)^dag gamma5 machinery supplies the rest of
+  // Eq. (18) for free. q_out is a 4D PropagatorField, summed over s.
+  void ContractMobiusConservedCurrent(PropagatorField &q_in_1,
+				       PropagatorField &q_in_2,
+				       PropagatorField &q_out,
+				       unsigned int mu);
 
    void SeqConservedCurrent(PropagatorField &q_in,
 			   PropagatorField &q_out,
