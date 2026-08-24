@@ -314,6 +314,32 @@ public:
     return accessor;
   }
 
+  int              traceID;
+  // Delivered-comms instrumentation, per CommunicateBegin/Complete pair.
+  //
+  // OffNodeBytes : bytes handed to MPI, i.e. EXCLUDING intranode traffic --
+  //   StencilSendToRecvFrom* return off-node bytes only, which is the
+  //   differentiation we want.  It is BIDIRECTIONAL (send + receive) under
+  //   ACCELERATOR_AWARE_MPI (Communicator_mpi3.cc:463,481).  On the
+  //   host-staged path the send is deferred to PollDtoH and its bytes are
+  //   NOT currently counted, so figures from the two paths are not
+  //   comparable.  Prepare() returns 0.0 on the accelerator-aware path.
+  //
+  // CommTimer : microseconds between traceStart and traceStop, i.e. exactly
+  //   the "Stencil::CommunicateBegin" roctx range -- transfer only, with the
+  //   StencilBarrier and the compress kernels already excluded.  It spans the
+  //   window in which the interior kernel runs, so the derived rate is
+  //   bandwidth delivered CONCURRENT WITH COMPUTE, which is the quantity a
+  //   comms-only benchmark cannot see.
+  //
+  // InterNodeBandwidthMBps : the per-call rate.  For a reportable figure
+  //   accumulate bytes and time separately across calls and divide once --
+  //   averaging per-call rates over-weights the fast calls.  See
+  //   benchmarks/Benchmark_dwf.cc.
+  double           OffNodeBytes;
+  double           CommTimer;
+  double           InterNodeBandwidthMBps;
+  
   int face_table_computed;
   //  int partialDirichlet;
   int fullDirichlet;
@@ -537,11 +563,13 @@ public:
       _grid->StencilBarrier(); 
 #endif
     }
-    
+    traceID = traceStart("Stencil Communicate");
+    OffNodeBytes=0;
+    CommTimer=-usecond();
     for(int i=0;i<Packets.size();i++){
       //      std::cout << "Communicate prepare "<<i<<std::endl;
       //      _grid->Barrier();
-      _grid->StencilSendToRecvFromPrepare(MpiReqs,
+      OffNodeBytes+=_grid->StencilSendToRecvFromPrepare(MpiReqs,
 					  Packets[i].compressed_send_buf,
 					  Packets[i].to_rank,Packets[i].do_send,
 					  Packets[i].compressed_recv_buf,
@@ -558,7 +586,7 @@ public:
     for(int i=0;i<Packets.size();i++){
       //      std::cout << "Communicate Begin "<<i<<std::endl;
       //      _grid->Barrier();
-      _grid->StencilSendToRecvFromBegin(MpiReqs,
+      OffNodeBytes+=_grid->StencilSendToRecvFromBegin(MpiReqs,
 					Packets[i].send_buf,Packets[i].compressed_send_buf,
 					Packets[i].to_rank,Packets[i].do_send,
 					Packets[i].recv_buf,Packets[i].compressed_recv_buf,
@@ -588,6 +616,10 @@ public:
     //    _grid->Barrier();
     _grid->StencilSendToRecvFromComplete(MpiReqs,0); // MPI is done
     //    if   ( this->partialDirichlet ) DslashLogPartial();
+    traceStop(traceID);
+    CommTimer+=usecond();
+    InterNodeBandwidthMBps = OffNodeBytes/CommTimer;
+    
     if ( this->fullDirichlet ) DslashLogDirichlet();
     else DslashLogFull();
     //    acceleratorCopySynchronise();// is in the StencilSendToRecvFromComplete
@@ -944,6 +976,12 @@ public:
 		   bool preserve_shm=false)
   {
     SloppyComms = 0;
+    // Never leave the delivered-comms counters uninitialised: they are read
+    // from outside (benchmarks, drivers) and a stencil that has not yet
+    // exchanged would otherwise return denormal garbage.
+    OffNodeBytes           = 0;
+    CommTimer              = 0;
+    InterNodeBandwidthMBps = 0;
     face_table_computed=0;
     _grid    = grid;
     this->parameters=p;
