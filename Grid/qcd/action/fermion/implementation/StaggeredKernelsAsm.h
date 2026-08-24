@@ -963,7 +963,7 @@ template <> inline void StaggeredKernels<StaggeredImplD>::DhopSiteAsm(StencilVie
 }
 
 #include <Grid/simd/Intel512single.h>
-template <> void StaggeredKernels<StaggeredImplF>::DhopSiteAsm(StencilView &st,
+template <> inline void StaggeredKernels<StaggeredImplF>::DhopSiteAsm(StencilView &st,
                                    DoubledGaugeFieldView &U,
                                    SiteSpinor *buf, int sF,
                                    int sU, const FermionFieldView &in, FermionFieldView &out,int dag)
@@ -1015,7 +1015,7 @@ template <> void StaggeredKernels<StaggeredImplF>::DhopSiteAsm(StencilView &st,
 }
 
 #include <Grid/simd/Intel512double.h>
-template <> void StaggeredKernels<StaggeredImplD>::DhopSiteAsm(StencilView &st,
+template <> inline void StaggeredKernels<StaggeredImplD>::DhopSiteAsm(StencilView &st,
                                    DoubledGaugeFieldView &U,
                                    SiteSpinor *buf, int sF,
                                    int sU, const FermionFieldView &in, FermionFieldView &out,int dag)
