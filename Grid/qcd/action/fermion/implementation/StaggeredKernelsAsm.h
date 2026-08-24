@@ -962,5 +962,109 @@ template <> void StaggeredKernels<StaggeredImplD>::DhopSiteAsm(StencilView &st,
 #endif
 }
 
+#include <Grid/simd/Intel512single.h>
+template <> void StaggeredKernels<StaggeredImplF>::DhopSiteAsm(StencilView &st,
+                                   DoubledGaugeFieldView &U,
+                                   SiteSpinor *buf, int sF,
+                                   int sU, const FermionFieldView &in, FermionFieldView &out,int dag)
+{
+#ifdef AVX512
+  uint64_t gauge0,gauge1,gauge2,gauge3;
+  uint64_t addr0,addr1,addr2,addr3;
+  const SiteSpinor *in_p; in_p = &in[0];
+
+  int o0,o1,o2,o3; // offsets
+  int l0,l1,l2,l3; // local
+  int p0,p1,p2,p3; // perm
+  int ptype;
+  StencilEntry *SE0;
+  StencilEntry *SE1;
+  StencilEntry *SE2;
+  StencilEntry *SE3;
+
+  //  for(int s=0;s<LLs;s++){
+  //    int sF=s+LLs*sU;
+  {
+    // Xp, Yp, Zp, Tp
+    PREPARE(Xp,Yp,Zp,Tp,0,U);
+    LOAD_CHIa(addr0,addr1);
+    PERMUTE01;
+    MULT_XYZT(gauge0,gauge1);
+    LOAD_CHIa(addr2,addr3);
+    PERMUTE23;
+    MULT_ADD_XYZT(gauge2,gauge3);
+    
+    PREPARE(Xm,Ym,Zm,Tm,0,U);
+    LOAD_CHIa(addr0,addr1);
+    PERMUTE01;
+    MULT_ADD_XYZT(gauge0,gauge1);
+    LOAD_CHIa(addr2,addr3);
+    PERMUTE23;
+    MULT_ADD_XYZT(gauge2,gauge3);
+    
+    addr0 = (uint64_t) &out[sF];
+    if ( dag ) {
+      nREDUCEa(addr0);
+    } else {
+      REDUCEa(addr0);
+    }
+  }
+#else
+  assert(0);
+#endif
+}
+
+#include <Grid/simd/Intel512double.h>
+template <> void StaggeredKernels<StaggeredImplD>::DhopSiteAsm(StencilView &st,
+                                   DoubledGaugeFieldView &U,
+                                   SiteSpinor *buf, int sF,
+                                   int sU, const FermionFieldView &in, FermionFieldView &out,int dag)
+{
+#ifdef AVX512
+  uint64_t gauge0,gauge1,gauge2,gauge3;
+  uint64_t addr0,addr1,addr2,addr3;
+  const SiteSpinor *in_p; in_p = &in[0];
+
+  int o0,o1,o2,o3; // offsets
+  int l0,l1,l2,l3; // local
+  int p0,p1,p2,p3; // perm
+  int ptype;
+  StencilEntry *SE0;
+  StencilEntry *SE1;
+  StencilEntry *SE2;
+  StencilEntry *SE3;
+
+  //  for(int s=0;s<LLs;s++){
+  //    int sF=s+LLs*sU;
+  {
+    // Xp, Yp, Zp, Tp
+    PREPARE(Xp,Yp,Zp,Tp,0,U);
+    LOAD_CHIa(addr0,addr1);
+    PERMUTE01;
+    MULT_XYZT(gauge0,gauge1);
+    LOAD_CHIa(addr2,addr3);
+    PERMUTE23;
+    MULT_ADD_XYZT(gauge2,gauge3);
+    
+    PREPARE(Xm,Ym,Zm,Tm,0,U);
+    LOAD_CHIa(addr0,addr1);
+    PERMUTE01;
+    MULT_ADD_XYZT(gauge0,gauge1);
+    LOAD_CHIa(addr2,addr3);
+    PERMUTE23;
+    MULT_ADD_XYZT(gauge2,gauge3);
+    
+    addr0 = (uint64_t) &out[sF];
+    if ( dag ) {
+      nREDUCEa(addr0);
+    } else {
+      REDUCEa(addr0);
+    }
+  }
+#else
+  assert(0);
+#endif
+}
+
 NAMESPACE_END(Grid);
 
