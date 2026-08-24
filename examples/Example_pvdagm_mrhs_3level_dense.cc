@@ -219,7 +219,7 @@ public:
   std::vector<ComplexF>   slab;         // nrows x N row-major rows of A^{-1}
   // CHUNKROWS=1024: fatter cgetrs_64 calls (trsm efficiency grows with nrhs;
   // 256 gave ~7s/chunk => 32min setup) and 4x fewer broadcasts.  Buffers 566MB.
-  static const int64_t CHUNKROWS = 1024;
+  static constexpr int64_t CHUNKROWS = 1024;
   static const int MRHS_MAX = 32;
 #ifdef GRID_HIP
   rocblas_float_complex *dSlab = nullptr;  // device-resident copy of the slab (all ranks)

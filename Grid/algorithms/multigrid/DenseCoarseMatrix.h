@@ -111,7 +111,7 @@ public:
   std::vector<int64_t>    myGsite;  // global lex site index of my site ss
   std::vector<ComplexF>   slab;     // nrows x N row-major: A during setup, rows of A^{-1} after
 
-  static const int64_t CHUNKROWS = 1024;  // getrs harvest block (trsm efficiency + fewer broadcasts)
+  static constexpr int64_t CHUNKROWS = 1024;  // getrs harvest block (trsm efficiency + fewer broadcasts)
   static const int MRHS_MAX = 32;
 
   // Apply machinery: resident slab + persistent buffers + AOT split-K pointers.

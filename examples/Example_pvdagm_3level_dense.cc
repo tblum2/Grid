@@ -263,7 +263,7 @@ public:
   std::vector<int64_t>    myGsite;      // global lex site index of my site ss
   std::vector<ComplexF>   slab;         // nrows x N row-major; A rows during probe,
                                         // A^{-1} rows after setup
-  static const int64_t CHUNKROWS = 256; // gather/broadcast chunk (256 x N x 8B ~ 141MB)
+  static constexpr int64_t CHUNKROWS = 256; // gather/broadcast chunk (256 x N x 8B ~ 141MB)
 
   DistributedDenseInverse(LinearOperatorBase<Field> &Op, GridBase *g, int nbasis_)
     : grid(g), _Op(Op), nbasis(nbasis_)
