@@ -68,6 +68,59 @@ NAMESPACE_BEGIN(Grid);
 enum GridBLASOperation_t { GridBLAS_OP_N, GridBLAS_OP_T, GridBLAS_OP_C } ;
 enum GridBLASPrecision_t { GridBLAS_PRECISION_DEFAULT, GridBLAS_PRECISION_16F, GridBLAS_PRECISION_16BF, GridBLAS_PRECISION_TF32 };
 
+///////////////////////////////////////////////////////////////////////////
+// BLAS scalar constants: the put() wrapper OWNS the residency policy so
+// call sites just pass values (scalars-live-on-the-host rule).
+//
+// Policy per backend:
+//  - CUDA / HIP : handles are put in HOST pointer mode at Init (cuBLAS docs
+//    2.2.7: host mode is the documented default; 2.1.5: host-mode scalars
+//    are consumed AT CALL TIME, "can be freed just after the return of the
+//    call even though the kernel launch is asynchronous").  put() stores
+//    the value in persistent host memory and returns its address: ZERO
+//    host->device copies.
+//  - SYCL : the oneMKL group-API alpha/beta arrays are dereferenced
+//    USM-side (spec is silent for the group API; implementation observed
+//    to require USM-accessible storage -- host stack pointers fault).
+//    put() keeps a device-resident copy with VALUE CACHING: the copy is
+//    issued only when the value changes (accumulation pattern
+//    beta = (p==0 ? 0 : 1) costs two copies per Mult instead of npoint).
+//
+// Motivation (rocprof, Frontier, 2026-08-13): per-call alpha/beta device
+// staging generated ~92k tiny staged hipMemcpys in a 12s solve window
+// (~26% of host API time) at the latency-bound coarse level.
+// NB not thread safe -- matches the single-threaded host BLAS call
+// pattern of the per-call staging it replaces.
+///////////////////////////////////////////////////////////////////////////
+template<class T>
+class GridBLASDeviceConstant {
+#ifdef GRID_SYCL
+  deviceVector<T> dev;
+  T               host;
+  int             valid;
+public:
+  GridBLASDeviceConstant() : dev(1), valid(0) {};
+  T * put(T v) {
+    if ( (!valid) || (v != host) ) {
+      acceleratorCopyToDevice((void *)&v,(void *)&dev[0],sizeof(T));
+      host  = v;
+      valid = 1;
+    }
+    return &dev[0];
+  }
+#else
+  // CUDA / HIP in HOST pointer mode (and CPU/Eigen, where the pointer is
+  // unused): persistent host storage, no copies ever.
+  T host;
+public:
+  GridBLASDeviceConstant() {};
+  T * put(T v) {
+    host = v;
+    return &host;
+  }
+#endif
+};
+
 class GridBLAS {
 public:
 
@@ -81,11 +134,32 @@ public:
 #ifdef GRID_CUDA
       std::cout << "cublasCreate"<<std::endl;
       cublasCreate(&gridblasHandle);
-      cublasSetPointerMode(gridblasHandle, CUBLAS_POINTER_MODE_DEVICE);
+      // HOST pointer mode: scalars consumed at call time from host memory
+      // (cuBLAS docs 2.1.5/2.2.7) -- no device staging of alpha/beta.
+      // DEVICE mode would be a deliberate opt-in for device-produced
+      // scalars (e.g. a future graph-captured solver).
+      cublasSetPointerMode(gridblasHandle, CUBLAS_POINTER_MODE_HOST);
+      {
+        cublasPointerMode_t pm;
+        cublasGetPointerMode(gridblasHandle,&pm);
+        std::cout << "GridBLAS: cuBLAS pointer mode "
+                  << ((pm==CUBLAS_POINTER_MODE_DEVICE)?"DEVICE":"HOST") <<std::endl;
+      }
 #endif
 #ifdef GRID_HIP
       std::cout << "hipblasCreate"<<std::endl;
-      hipblasCreate(&gridblasHandle);
+      GRID_ASSERT( hipblasCreate(&gridblasHandle) == HIPBLAS_STATUS_SUCCESS );
+      // Explicit HOST mode: the hipBLAS default is UNDOCUMENTED in the
+      // headers (enum 0 == HOST by cuBLAS-mirroring convention only);
+      // set it and print it so every log carries the ground truth.
+      GRID_ASSERT( hipblasSetPointerMode(gridblasHandle, HIPBLAS_POINTER_MODE_HOST)
+                   == HIPBLAS_STATUS_SUCCESS );
+      {
+        hipblasPointerMode_t pm;
+        GRID_ASSERT( hipblasGetPointerMode(gridblasHandle,&pm) == HIPBLAS_STATUS_SUCCESS );
+        std::cout << "GridBLAS: hipBLAS pointer mode "
+                  << ((pm==HIPBLAS_POINTER_MODE_DEVICE)?"DEVICE":"HOST") <<std::endl;
+      }
 #endif
 #ifdef GRID_SYCL
       gridblasHandle = theGridAccelerator;
@@ -240,11 +314,11 @@ public:
     if(OpB!=GridBLAS_OP_N)
       ldb = n;
     
-    static deviceVector<ComplexD> alpha_p(1);
-    static deviceVector<ComplexD> beta_p(1);
-    // can prestore the 1 and the zero on device
-    acceleratorCopyToDevice((void *)&alpha,(void *)&alpha_p[0],sizeof(ComplexD));
-    acceleratorCopyToDevice((void *)&beta ,(void *)&beta_p[0],sizeof(ComplexD));
+    // Cached device constants: copy only on value change (see GridBLASDeviceConstant)
+    static GridBLASDeviceConstant<ComplexD> alpha_c;
+    static GridBLASDeviceConstant<ComplexD> beta_c;
+    ComplexD *alpha_p = alpha_c.put(alpha);
+    ComplexD *beta_p  = beta_c.put(beta);
     RealD t0=usecond();
     //    std::cout << "ZgemmBatched mnk  "<<m<<","<<n<<","<<k<<" count "<<batchCount<<std::endl;
 #ifdef GRID_HIP
@@ -498,11 +572,11 @@ public:
       lda = k;
     if(OpB!=GridBLAS_OP_N)
       ldb = n;
-    static deviceVector<ComplexF> alpha_p(1);
-    static deviceVector<ComplexF> beta_p(1);
-    // can prestore the 1 and the zero on device
-    acceleratorCopyToDevice((void *)&alpha,(void *)&alpha_p[0],sizeof(ComplexF));
-    acceleratorCopyToDevice((void *)&beta ,(void *)&beta_p[0],sizeof(ComplexF));
+    // Cached device constants: copy only on value change (see GridBLASDeviceConstant)
+    static GridBLASDeviceConstant<ComplexF> alpha_c;
+    static GridBLASDeviceConstant<ComplexF> beta_c;
+    ComplexF *alpha_p = alpha_c.put(alpha);
+    ComplexF *beta_p  = beta_c.put(beta);
     RealD t0=usecond();
 
     GRID_ASSERT(Bkn.size()==batchCount);
@@ -695,6 +769,456 @@ public:
      RealD bytes = 1.0*sizeof(ComplexF)*(m*k+k*n+m*n)*batchCount;
   }
   
+  ///////////////////////////////////////////////////////////////////////////////////
+  // Explicit-leading-dimension complex single GEMM.
+  //
+  // A,B,C may be SLICES of larger parent allocations: lda/ldb/ldc are the
+  // PARENT strides (>= the compact values the ten-argument overload derives).
+  // Motivating use: software split-K for tiny-output/huge-K dense multiplies
+  // (arXiv:2409.03904 fig 11; cf MultiRHSBlockCGLinalg) -- batch over K-chunks
+  // of a dense slab by pointer offset j*Kchunk with lda = the full K extent,
+  // then reduce the partial C's.  Backends pass lda straight through; only
+  // the compact overload invented them.
+  ///////////////////////////////////////////////////////////////////////////////////
+  void gemmBatched(GridBLASOperation_t OpA,
+		   GridBLASOperation_t OpB,
+		   int m,int n, int k,
+		   ComplexF alpha,
+		   deviceVector<ComplexF*> &Amk, int lda,
+		   deviceVector<ComplexF*> &Bkn, int ldb,
+		   ComplexF beta,
+		   deviceVector<ComplexF*> &Cmn, int ldc,
+		   GridBLASPrecision_t precision = GridBLAS_PRECISION_DEFAULT)
+  {
+    RealD t2=usecond();
+    int32_t batchCount = Amk.size();
+
+    GRID_ASSERT( lda >= ((OpA==GridBLAS_OP_N) ? m : k) );
+    GRID_ASSERT( ldb >= ((OpB==GridBLAS_OP_N) ? k : n) );
+    GRID_ASSERT( ldc >= m );
+
+    // Cached device constants: copy only on value change (see GridBLASDeviceConstant)
+    static GridBLASDeviceConstant<ComplexF> alpha_c;
+    static GridBLASDeviceConstant<ComplexF> beta_c;
+    ComplexF *alpha_p = alpha_c.put(alpha);
+    ComplexF *beta_p  = beta_c.put(beta);
+    RealD t0=usecond();
+
+    GRID_ASSERT(Bkn.size()==batchCount);
+    GRID_ASSERT(Cmn.size()==batchCount);
+#ifdef GRID_HIP
+    GRID_ASSERT(precision == GridBLAS_PRECISION_DEFAULT);
+    hipblasOperation_t hOpA;
+    hipblasOperation_t hOpB;
+    if ( OpA == GridBLAS_OP_N ) hOpA = HIPBLAS_OP_N;
+    if ( OpA == GridBLAS_OP_T ) hOpA = HIPBLAS_OP_T;
+    if ( OpA == GridBLAS_OP_C ) hOpA = HIPBLAS_OP_C;
+    if ( OpB == GridBLAS_OP_N ) hOpB = HIPBLAS_OP_N;
+    if ( OpB == GridBLAS_OP_T ) hOpB = HIPBLAS_OP_T;
+    if ( OpB == GridBLAS_OP_C ) hOpB = HIPBLAS_OP_C;
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
+    auto err = hipblasCgemmBatched(gridblasHandle,
+				   hOpA,
+				   hOpB,
+				   m,n,k,
+				   (hipComplex *) &alpha_p[0],
+				   (hipComplex **)&Amk[0], lda,
+				   (hipComplex **)&Bkn[0], ldb,
+				   (hipComplex *) &beta_p[0],
+				   (hipComplex **)&Cmn[0], ldc,
+				   batchCount);
+#else
+    auto err = hipblasCgemmBatched(gridblasHandle,
+                                   hOpA,
+                                   hOpB,
+                                   m,n,k,
+                                   (hipblasComplex *) &alpha_p[0],
+                                   (hipblasComplex **)&Amk[0], lda,
+                                   (hipblasComplex **)&Bkn[0], ldb,
+                                   (hipblasComplex *) &beta_p[0],
+                                   (hipblasComplex **)&Cmn[0], ldc,
+                                   batchCount);
+#endif
+    GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
+#endif
+#ifdef GRID_CUDA
+    cublasOperation_t hOpA;
+    cublasOperation_t hOpB;
+    if ( OpA == GridBLAS_OP_N ) hOpA = CUBLAS_OP_N;
+    if ( OpA == GridBLAS_OP_T ) hOpA = CUBLAS_OP_T;
+    if ( OpA == GridBLAS_OP_C ) hOpA = CUBLAS_OP_C;
+    if ( OpB == GridBLAS_OP_N ) hOpB = CUBLAS_OP_N;
+    if ( OpB == GridBLAS_OP_T ) hOpB = CUBLAS_OP_T;
+    if ( OpB == GridBLAS_OP_C ) hOpB = CUBLAS_OP_C;
+    cublasStatus_t err;
+    if (precision == GridBLAS_PRECISION_DEFAULT) {
+      err = cublasCgemmBatched(gridblasHandle,
+			       hOpA,
+			       hOpB,
+			       m,n,k,
+			       (cuComplex *) &alpha_p[0],
+			       (cuComplex **)&Amk[0], lda,
+			       (cuComplex **)&Bkn[0], ldb,
+			       (cuComplex *) &beta_p[0],
+			       (cuComplex **)&Cmn[0], ldc,
+			       batchCount);
+    } else {
+      cublasComputeType_t compute_precision = toDataType(precision);
+      err = cublasGemmBatchedEx(gridblasHandle,
+				hOpA,
+				hOpB,
+				m,n,k,
+				(void *) &alpha_p[0],
+				(void **)&Amk[0], CUDA_C_32F, lda,
+				(void **)&Bkn[0], CUDA_C_32F, ldb,
+				(void *) &beta_p[0],
+				(void **)&Cmn[0], CUDA_C_32F, ldc,
+				batchCount, compute_precision, CUBLAS_GEMM_DEFAULT);
+    }
+    GRID_ASSERT(err==CUBLAS_STATUS_SUCCESS);
+#endif
+#ifdef GRID_SYCL
+    GRID_ASSERT(precision == GridBLAS_PRECISION_DEFAULT);
+    int64_t m64=m;
+    int64_t n64=n;
+    int64_t k64=k;
+    int64_t lda64=lda;
+    int64_t ldb64=ldb;
+    int64_t ldc64=ldc;
+    int64_t batchCount64=batchCount;
+
+    oneapi::mkl::transpose iOpA;
+    oneapi::mkl::transpose iOpB;
+
+    if ( OpA == GridBLAS_OP_N ) iOpA = oneapi::mkl::transpose::N;
+    if ( OpA == GridBLAS_OP_T ) iOpA = oneapi::mkl::transpose::T;
+    if ( OpA == GridBLAS_OP_C ) iOpA = oneapi::mkl::transpose::C;
+    if ( OpB == GridBLAS_OP_N ) iOpB = oneapi::mkl::transpose::N;
+    if ( OpB == GridBLAS_OP_T ) iOpB = oneapi::mkl::transpose::T;
+    if ( OpB == GridBLAS_OP_C ) iOpB = oneapi::mkl::transpose::C;
+
+    oneapi::mkl::blas::column_major::gemm_batch(*gridblasHandle,
+						&iOpA,
+						&iOpB,
+						&m64,&n64,&k64,
+						(ComplexF *) &alpha_p[0],
+						(const ComplexF **)&Amk[0], (const int64_t *)&lda64,
+						(const ComplexF **)&Bkn[0], (const int64_t *)&ldb64,
+						(ComplexF *) &beta_p[0],
+						(ComplexF **)&Cmn[0], (const int64_t *)&ldc64,
+						(int64_t)1,&batchCount64,std::vector<sycl::event>());
+    synchronise();
+#endif
+#if !defined(GRID_SYCL) && !defined(GRID_CUDA) && !defined(GRID_HIP)
+    GRID_ASSERT(precision == GridBLAS_PRECISION_DEFAULT);
+    // Reference implementation: Eigen with explicit outer stride
+    typedef Eigen::Map<Eigen::MatrixXcf,0,Eigen::OuterStride<> > eMat;
+    if ( (OpA == GridBLAS_OP_N ) && (OpB == GridBLAS_OP_N) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],m,k,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],k,n,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk * eBkn ;
+	else
+	  eCmn = alpha * eAmk * eBkn ;
+	});
+    } else if ( (OpA == GridBLAS_OP_C ) && (OpB == GridBLAS_OP_N) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],k,n,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk.adjoint() * eBkn ;
+	else
+	  eCmn = alpha * eAmk.adjoint() * eBkn ;
+	});
+    } else if ( (OpA == GridBLAS_OP_T ) && (OpB == GridBLAS_OP_N) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],k,n,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk.transpose() * eBkn ;
+	else
+	  eCmn = alpha * eAmk.transpose() * eBkn ;
+	});
+    } else if ( (OpA == GridBLAS_OP_N ) && (OpB == GridBLAS_OP_C) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],m,k,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk * eBkn.adjoint() ;
+	else
+	  eCmn = alpha * eAmk * eBkn.adjoint() ;
+	});
+    } else if ( (OpA == GridBLAS_OP_N ) && (OpB == GridBLAS_OP_T) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],m,k,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk * eBkn.transpose() ;
+	else
+	  eCmn = alpha * eAmk * eBkn.transpose() ;
+	});
+    } else if ( (OpA == GridBLAS_OP_C ) && (OpB == GridBLAS_OP_C) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk.adjoint() * eBkn.adjoint() ;
+	else
+	  eCmn = alpha * eAmk.adjoint() * eBkn.adjoint() ;
+	} );
+    } else if ( (OpA == GridBLAS_OP_T ) && (OpB == GridBLAS_OP_T) ) {
+      thread_for (p, batchCount, {
+	eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+	eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+	eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+	if (std::abs(beta) != 0.0)
+	  eCmn = beta * eCmn + alpha * eAmk.transpose() * eBkn.transpose() ;
+	else
+	  eCmn = alpha * eAmk.transpose() * eBkn.transpose() ;
+	} );
+    } else {
+      assert(0);
+    }
+#endif
+    RealD t1=usecond();
+    RealD flops = 8.0*m*n*k*batchCount;
+    RealD bytes = 1.0*sizeof(ComplexF)*(m*k+k*n+m*n)*batchCount;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////////
+  // Explicit-leading-dimension complex double GEMM.  Mirror of the ComplexF
+  // overload above; motivating use is the fp64 distributed recursive Schur
+  // inversion (RecursiveSchurInverse), whose operands are column windows of
+  // larger row-slab allocations.
+  ///////////////////////////////////////////////////////////////////////////////////
+  void gemmBatched(GridBLASOperation_t OpA,
+                   GridBLASOperation_t OpB,
+                   int m,int n, int k,
+                   ComplexD alpha,
+                   deviceVector<ComplexD*> &Amk, int lda,
+                   deviceVector<ComplexD*> &Bkn, int ldb,
+                   ComplexD beta,
+                   deviceVector<ComplexD*> &Cmn, int ldc)
+  {
+    RealD t2=usecond();
+    int32_t batchCount = Amk.size();
+
+    GRID_ASSERT( lda >= ((OpA==GridBLAS_OP_N) ? m : k) );
+    GRID_ASSERT( ldb >= ((OpB==GridBLAS_OP_N) ? k : n) );
+    GRID_ASSERT( ldc >= m );
+
+    // Cached device constants: copy only on value change (see GridBLASDeviceConstant)
+    static GridBLASDeviceConstant<ComplexD> alpha_c;
+    static GridBLASDeviceConstant<ComplexD> beta_c;
+    ComplexD *alpha_p = alpha_c.put(alpha);
+    ComplexD *beta_p  = beta_c.put(beta);
+    RealD t0=usecond();
+
+    GRID_ASSERT(Bkn.size()==batchCount);
+    GRID_ASSERT(Cmn.size()==batchCount);
+#ifdef GRID_HIP
+    hipblasOperation_t hOpA;
+    hipblasOperation_t hOpB;
+    if ( OpA == GridBLAS_OP_N ) hOpA = HIPBLAS_OP_N;
+    if ( OpA == GridBLAS_OP_T ) hOpA = HIPBLAS_OP_T;
+    if ( OpA == GridBLAS_OP_C ) hOpA = HIPBLAS_OP_C;
+    if ( OpB == GridBLAS_OP_N ) hOpB = HIPBLAS_OP_N;
+    if ( OpB == GridBLAS_OP_T ) hOpB = HIPBLAS_OP_T;
+    if ( OpB == GridBLAS_OP_C ) hOpB = HIPBLAS_OP_C;
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
+    auto err = hipblasZgemmBatched(gridblasHandle,
+                                   hOpA,
+                                   hOpB,
+                                   m,n,k,
+                                   (hipDoubleComplex *) &alpha_p[0],
+                                   (hipDoubleComplex **)&Amk[0], lda,
+                                   (hipDoubleComplex **)&Bkn[0], ldb,
+                                   (hipDoubleComplex *) &beta_p[0],
+                                   (hipDoubleComplex **)&Cmn[0], ldc,
+                                   batchCount);
+#else
+    auto err = hipblasZgemmBatched(gridblasHandle,
+                                   hOpA,
+                                   hOpB,
+                                   m,n,k,
+                                   (hipblasDoubleComplex *) &alpha_p[0],
+                                   (hipblasDoubleComplex **)&Amk[0], lda,
+                                   (hipblasDoubleComplex **)&Bkn[0], ldb,
+                                   (hipblasDoubleComplex *) &beta_p[0],
+                                   (hipblasDoubleComplex **)&Cmn[0], ldc,
+                                   batchCount);
+#endif
+    GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
+#endif
+#ifdef GRID_CUDA
+    cublasOperation_t hOpA;
+    cublasOperation_t hOpB;
+    if ( OpA == GridBLAS_OP_N ) hOpA = CUBLAS_OP_N;
+    if ( OpA == GridBLAS_OP_T ) hOpA = CUBLAS_OP_T;
+    if ( OpA == GridBLAS_OP_C ) hOpA = CUBLAS_OP_C;
+    if ( OpB == GridBLAS_OP_N ) hOpB = CUBLAS_OP_N;
+    if ( OpB == GridBLAS_OP_T ) hOpB = CUBLAS_OP_T;
+    if ( OpB == GridBLAS_OP_C ) hOpB = CUBLAS_OP_C;
+    auto err = cublasZgemmBatched(gridblasHandle,
+                                  hOpA,
+                                  hOpB,
+                                  m,n,k,
+                                  (cuDoubleComplex *) &alpha_p[0],
+                                  (cuDoubleComplex **)&Amk[0], lda,
+                                  (cuDoubleComplex **)&Bkn[0], ldb,
+                                  (cuDoubleComplex *) &beta_p[0],
+                                  (cuDoubleComplex **)&Cmn[0], ldc,
+                                  batchCount);
+    GRID_ASSERT(err==CUBLAS_STATUS_SUCCESS);
+#endif
+#ifdef GRID_SYCL
+    int64_t m64=m;
+    int64_t n64=n;
+    int64_t k64=k;
+    int64_t lda64=lda;
+    int64_t ldb64=ldb;
+    int64_t ldc64=ldc;
+    int64_t batchCount64=batchCount;
+
+    oneapi::mkl::transpose iOpA;
+    oneapi::mkl::transpose iOpB;
+
+    if ( OpA == GridBLAS_OP_N ) iOpA = oneapi::mkl::transpose::N;
+    if ( OpA == GridBLAS_OP_T ) iOpA = oneapi::mkl::transpose::T;
+    if ( OpA == GridBLAS_OP_C ) iOpA = oneapi::mkl::transpose::C;
+    if ( OpB == GridBLAS_OP_N ) iOpB = oneapi::mkl::transpose::N;
+    if ( OpB == GridBLAS_OP_T ) iOpB = oneapi::mkl::transpose::T;
+    if ( OpB == GridBLAS_OP_C ) iOpB = oneapi::mkl::transpose::C;
+
+    oneapi::mkl::blas::column_major::gemm_batch(*gridblasHandle,
+                                                &iOpA,
+                                                &iOpB,
+                                                &m64,&n64,&k64,
+                                                (ComplexD *) &alpha_p[0],
+                                                (const ComplexD **)&Amk[0], (const int64_t *)&lda64,
+                                                (const ComplexD **)&Bkn[0], (const int64_t *)&ldb64,
+                                                (ComplexD *) &beta_p[0],
+                                                (ComplexD **)&Cmn[0], (const int64_t *)&ldc64,
+                                                (int64_t)1,&batchCount64,std::vector<sycl::event>());
+    synchronise();
+#endif
+#if !defined(GRID_SYCL) && !defined(GRID_CUDA) && !defined(GRID_HIP)
+    // Reference implementation: Eigen with explicit outer stride
+    typedef Eigen::Map<Eigen::MatrixXcd,0,Eigen::OuterStride<> > eMat;
+    if ( (OpA == GridBLAS_OP_N ) && (OpB == GridBLAS_OP_N) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],m,k,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],k,n,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk * eBkn;
+        }
+        else
+        {
+          eCmn = alpha * eAmk * eBkn;
+        }
+      });
+    } else if ( (OpA == GridBLAS_OP_C ) && (OpB == GridBLAS_OP_N) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],k,n,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk.adjoint() * eBkn;
+        }
+        else
+        {
+          eCmn = alpha * eAmk.adjoint() * eBkn;
+        }
+      });
+    } else if ( (OpA == GridBLAS_OP_T ) && (OpB == GridBLAS_OP_N) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],k,n,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk.transpose() * eBkn;
+        }
+        else
+        {
+          eCmn = alpha * eAmk.transpose() * eBkn;
+        }
+      });
+    } else if ( (OpA == GridBLAS_OP_N ) && (OpB == GridBLAS_OP_C) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],m,k,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk * eBkn.adjoint();
+        }
+        else
+        {
+          eCmn = alpha * eAmk * eBkn.adjoint();
+        }
+      });
+    } else if ( (OpA == GridBLAS_OP_N ) && (OpB == GridBLAS_OP_T) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],m,k,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk * eBkn.transpose();
+        }
+        else
+        {
+          eCmn = alpha * eAmk * eBkn.transpose();
+        }
+      });
+    } else if ( (OpA == GridBLAS_OP_C ) && (OpB == GridBLAS_OP_C) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk.adjoint() * eBkn.adjoint();
+        }
+        else
+        {
+          eCmn = alpha * eAmk.adjoint() * eBkn.adjoint();
+        }
+      });
+    } else if ( (OpA == GridBLAS_OP_T ) && (OpB == GridBLAS_OP_T) ) {
+      thread_for (p, batchCount, {
+        eMat eAmk(Amk[p],k,m,Eigen::OuterStride<>(lda));
+        eMat eBkn(Bkn[p],n,k,Eigen::OuterStride<>(ldb));
+        eMat eCmn(Cmn[p],m,n,Eigen::OuterStride<>(ldc));
+        if (std::abs(beta) != 0.0)
+        {
+          eCmn = beta * eCmn + alpha * eAmk.transpose() * eBkn.transpose();
+        }
+        else
+        {
+          eCmn = alpha * eAmk.transpose() * eBkn.transpose();
+        }
+      });
+    } else {
+      assert(0);
+    }
+#endif
+    RealD t1=usecond();
+    RealD flops = 8.0*m*n*k*batchCount;
+    RealD bytes = 1.0*sizeof(ComplexD)*(m*k+k*n+m*n)*batchCount;
+  }
+
   ///////////////////////////////////////////////////////////////////////////
   // Single precision real GEMM
   ///////////////////////////////////////////////////////////////////////////
@@ -721,11 +1245,11 @@ public:
       lda = k;
     if(OpB!=GridBLAS_OP_N)
       ldb = n;
-    static deviceVector<RealF> alpha_p(1);
-    static deviceVector<RealF> beta_p(1);
-    // can prestore the 1 and the zero on device
-    acceleratorCopyToDevice((void *)&alpha,(void *)&alpha_p[0],sizeof(RealF));
-    acceleratorCopyToDevice((void *)&beta ,(void *)&beta_p[0],sizeof(RealF));
+    // Cached device constants: copy only on value change (see GridBLASDeviceConstant)
+    static GridBLASDeviceConstant<RealF> alpha_c;
+    static GridBLASDeviceConstant<RealF> beta_c;
+    RealF *alpha_p = alpha_c.put(alpha);
+    RealF *beta_p  = beta_c.put(beta);
     RealD t0=usecond();
 
     GRID_ASSERT(Bkn.size()==batchCount);
@@ -882,11 +1406,11 @@ public:
     if(OpB!=GridBLAS_OP_N)
       ldb = n;
     
-    static deviceVector<RealD> alpha_p(1);
-    static deviceVector<RealD> beta_p(1);
-    // can prestore the 1 and the zero on device
-    acceleratorCopyToDevice((void *)&alpha,(void *)&alpha_p[0],sizeof(RealD));
-    acceleratorCopyToDevice((void *)&beta ,(void *)&beta_p[0],sizeof(RealD));
+    // Cached device constants: copy only on value change (see GridBLASDeviceConstant)
+    static GridBLASDeviceConstant<RealD> alpha_c;
+    static GridBLASDeviceConstant<RealD> beta_c;
+    RealD *alpha_p = alpha_c.put(alpha);
+    RealD *beta_p  = beta_c.put(beta);
     RealD t0=usecond();
 
     GRID_ASSERT(Bkn.size()==batchCount);

@@ -102,6 +102,63 @@ public:
     {
       PokeIndex<LorentzIndex>(U_ds, U, mu);
     }
+  #if 1
+    inline void DoubleStore(GridBase *GaugeGrid,
+                            DoubledGaugeField &UUUds, // for Naik term
+                            DoubledGaugeField &Uds,
+                            const GaugeField &Ulong,
+                            const GaugeField &Ufat)
+      {
+          conformable(Uds.Grid(), GaugeGrid);
+          conformable(Ufat.Grid(), GaugeGrid);
+          conformable(Ulong.Grid(), GaugeGrid);
+          GaugeLinkField U(GaugeGrid);
+          GaugeLinkField UUU(GaugeGrid);
+          GaugeLinkField Udag(GaugeGrid);
+          GaugeLinkField UUUdag(GaugeGrid);
+          
+          for (int mu = 0; mu < Nd; mu++) {
+              
+              // Staggered Phase.
+              Lattice<iScalar<vInteger> > coor(GaugeGrid);
+              Lattice<iScalar<vInteger> > x(GaugeGrid); LatticeCoordinate(x,0);
+              Lattice<iScalar<vInteger> > y(GaugeGrid); LatticeCoordinate(y,1);
+              Lattice<iScalar<vInteger> > z(GaugeGrid); LatticeCoordinate(z,2);
+              Lattice<iScalar<vInteger> > t(GaugeGrid); LatticeCoordinate(t,3);
+              
+              Lattice<iScalar<vInteger> > lin_z(GaugeGrid); lin_z=x+y;
+              Lattice<iScalar<vInteger> > lin_t(GaugeGrid); lin_t=x+y+z;
+              
+              ComplexField phases(GaugeGrid);    phases=1.0;
+              
+              if ( mu == 1 ) phases = where( mod(x    ,2)==(Integer)0, phases,-phases);
+              if ( mu == 2 ) phases = where( mod(lin_z,2)==(Integer)0, phases,-phases);
+              if ( mu == 3 ) phases = where( mod(lin_t,2)==(Integer)0, phases,-phases);
+              
+              // 1 hop based on fat links
+              U      = PeekIndex<LorentzIndex>(Ufat, mu);
+              Udag   = adj( Cshift(U, mu, -1));
+              
+              U    = U    *phases;
+              Udag = Udag *phases;
+              
+              InsertGaugeField(Uds,U,mu);
+              InsertGaugeField(Uds,Udag,mu+4);
+              
+              // see https://arxiv.org/pdf/1004.0342.pdf, appendix A
+  
+              UUU  = PeekIndex<LorentzIndex>(Ulong, mu);
+              UUUdag = adj( Cshift(UUU, mu, -3));
+  
+              UUU    = UUU    *phases;
+              UUUdag = UUUdag *phases;
+              
+              InsertGaugeField(UUUds,UUU,mu);
+              InsertGaugeField(UUUds,UUUdag,mu+4);
+              
+          }
+      }
+#else
   inline void DoubleStore(GridBase *GaugeGrid,
 			  DoubledGaugeField &UUUds, // for Naik term
 			  DoubledGaugeField &Uds,
@@ -160,6 +217,7 @@ public:
 
     }
   }
+#endif
 
   inline void InsertForce4D(GaugeField &mat, FermionField &Btilde, FermionField &A,int mu){
     GaugeLinkField link(mat.Grid());
@@ -175,5 +233,14 @@ public:
 typedef StaggeredImpl<vComplex,  FundamentalRepresentation > StaggeredImplR;   // Real.. whichever prec
 typedef StaggeredImpl<vComplexF, FundamentalRepresentation > StaggeredImplF;  // Float
 typedef StaggeredImpl<vComplexD, FundamentalRepresentation > StaggeredImplD;  // Double
+
+/////////////////////////////////////////////////////////////////////////////
+// Lexicographic staggered implementations
+/////////////////////////////////////////////////////////////////////////////
+typedef StaggeredImpl<sComplexF, FundamentalRepresentation > lexStaggeredImplF;
+typedef StaggeredImpl<sComplexD, FundamentalRepresentation > lexStaggeredImplD;
+/////////////////////////////////////////////////////////////////////////////
+// End lexicographic staggered implementations
+/////////////////////////////////////////////////////////////////////////////
 
 NAMESPACE_END(Grid);

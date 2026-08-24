@@ -32,7 +32,11 @@ directory
 
 NAMESPACE_BEGIN(Grid);
 
-int StaggeredKernelsStatic::Opt= StaggeredKernelsStatic::OptGeneric;
+#ifdef AVX512
+  int StaggeredKernelsStatic::Opt=StaggeredKernelsStatic::OptInlineAsm;
+#else
+  int StaggeredKernelsStatic::Opt=StaggeredKernelsStatic::OptGeneric;
+#endif
 int StaggeredKernelsStatic::Comms = StaggeredKernelsStatic::CommsAndCompute;
 
 NAMESPACE_END(Grid);
