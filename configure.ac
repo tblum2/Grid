@@ -80,6 +80,27 @@ AC_CHECK_DECLS([be64toh],[], [], [[#include <arpa/inet.h>]])
 AC_CHECK_LIB([m],[cos])
 AC_CHECK_LIB([stdc++],[abort])
 
+############## SLATE (+ BLAS++ / LAPACK++, which SLATE's headers include)
+# All three may live in different prefixes (e.g. Frontier: site blaspp under
+# /sw, self-built lapackpp/slate under spack); blaspp/lapackpp default to the
+# slate prefix.  Both lib and lib64 are searched (spack uses lib on macOS,
+# lib64 on Frontier).
+AC_ARG_WITH([slate],
+    [AS_HELP_STRING([--with-slate=prefix],
+    [try this for a non-standard install prefix of the SLATE library])],
+    [AM_CXXFLAGS="-I$with_slate/include $AM_CXXFLAGS"]
+    [AM_LDFLAGS="-L$with_slate/lib -L$with_slate/lib64 $AM_LDFLAGS"])
+AC_ARG_WITH([blaspp],
+    [AS_HELP_STRING([--with-blaspp=prefix],
+    [install prefix of BLAS++ (default: the SLATE prefix)])],
+    [AM_CXXFLAGS="-I$with_blaspp/include $AM_CXXFLAGS"]
+    [AM_LDFLAGS="-L$with_blaspp/lib -L$with_blaspp/lib64 $AM_LDFLAGS"])
+AC_ARG_WITH([lapackpp],
+    [AS_HELP_STRING([--with-lapackpp=prefix],
+    [install prefix of LAPACK++ (default: the SLATE prefix)])],
+    [AM_CXXFLAGS="-I$with_lapackpp/include $AM_CXXFLAGS"]
+    [AM_LDFLAGS="-L$with_lapackpp/lib -L$with_lapackpp/lib64 $AM_LDFLAGS"])
+
 ############### GMP and MPFR
 AC_ARG_WITH([gmp],
     [AS_HELP_STRING([--with-gmp=prefix],
@@ -407,6 +428,51 @@ AC_SEARCH_LIBS([fftw_execute], [fftw3],
                                [AC_MSG_ERROR("single precision FFTW library not found")])]
                [AC_DEFINE([HAVE_FFTW], [1], [Define to 1 if you have the `FFTW' library])]
                [have_fftw=true])
+
+############### SLATE
+# libslate exports no C-linkage symbols (all mangled C++), so AC_SEARCH_LIBS
+# cannot probe it.  Link a real C++ call, slate::version(), with the full
+# -lslate -llapackpp -lblaspp chain; MPI comes from CXX=mpicxx.
+# Only attempted when --with-slate is given: SLATE is optional and heavy.
+have_slate=false
+if test "x$with_slate" != "x"; then
+  AC_MSG_CHECKING([for SLATE (slate::version)])
+  ac_save_LIBS="$LIBS"
+  ac_save_CXXFLAGS="$CXXFLAGS"
+  ac_save_LDFLAGS="$LDFLAGS"
+  LIBS="-lslate -llapackpp -lblaspp $LIBS"
+  CXXFLAGS="$AM_CXXFLAGS $CXXFLAGS"
+  LDFLAGS="$AM_LDFLAGS $LDFLAGS"
+  # Constructing a slate::Matrix instantiates SLATE templates in the CALLER's
+  # object, which reference omp_*_nest_lock: the user program needs an OpenMP
+  # runtime on its own link line even when Grid itself is built without
+  # OpenMP (GPU builds).  Try bare, then with -lomp (LLVM/ROCm/Apple), then
+  # -lgomp (GCC).
+  slate_prog='#include <slate/slate.hh>
+              #include <complex>'
+  slate_body='slate::Matrix<std::complex<double> > A(4,4,2,1,1,MPI_COMM_WORLD);
+              return slate::version() > 0 ? 0 : 1;'
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([$slate_prog],[$slate_body])],
+                 [have_slate=true; slate_omp=""],
+                 [LIBS="-lomp $LIBS"
+                  AC_LINK_IFELSE([AC_LANG_PROGRAM([$slate_prog],[$slate_body])],
+                                 [have_slate=true; slate_omp="-lomp"],
+                                 [LIBS="-lgomp $ac_save_LIBS"; LIBS="-lslate -llapackpp -lblaspp $LIBS"
+                                  AC_LINK_IFELSE([AC_LANG_PROGRAM([$slate_prog],[$slate_body])],
+                                                 [have_slate=true; slate_omp="-lgomp"],
+                                                 [have_slate=false])])])
+  if test "x$have_slate" = xtrue; then
+    AC_DEFINE([HAVE_SLATE], [1], [Define to 1 if you have the SLATE library])
+    AC_MSG_RESULT([yes${slate_omp:+ (needs $slate_omp)}])
+  else
+    LIBS="$ac_save_LIBS"
+    AC_MSG_RESULT([no])
+    AC_MSG_ERROR([--with-slate given but SLATE (with BLAS++/LAPACK++ and an OpenMP runtime) failed to link; check --with-blaspp/--with-lapackpp and LDFLAGS for libomp])
+  fi
+  CXXFLAGS="$ac_save_CXXFLAGS"
+  LDFLAGS="$ac_save_LDFLAGS"
+fi
+AM_CONDITIONAL(BUILD_SLATE, [ test "${have_slate}X" == "trueX" ])
 
 AC_SEARCH_LIBS([limeCreateReader], [lime],
                [AC_DEFINE([HAVE_LIME], [1], [Define to 1 if you have the `LIME' library])]
@@ -886,6 +952,7 @@ GMP                         : `if test "x$have_gmp" = xtrue; then echo yes; else
 LAPACK                      : ${ac_LAPACK}
 FFTW                        : `if test "x$have_fftw" = xtrue; then echo yes; else echo no; fi`
 LIME (ILDG support)         : `if test "x$have_lime" = xtrue; then echo yes; else echo no; fi`
+SLATE                       : `if test "x$have_slate" = xtrue; then echo yes; else echo no; fi`
 HDF5                        : `if test "x$have_hdf5" = xtrue; then echo yes; else echo no; fi`
 build DOXYGEN documentation : `if test "$DX_FLAG_doc" = '1'; then echo yes; else echo no; fi`
 Sp2n                        : ${ac_ENABLE_SP}
