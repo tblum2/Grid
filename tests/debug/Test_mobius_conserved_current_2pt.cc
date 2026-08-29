@@ -40,6 +40,17 @@ directory
 // gamma5(.)^dag gamma5 machinery to realize Eq. (18)'s
 // gamma5 G^dag(x,Ls-1-s) gamma5 term -- no second linear solve.
 //
+// The current is computed in all four directions (X, Y, Z, T). Only the
+// mu=T correlator is constant in t (the spatial sum makes it a conserved
+// charge); the spatial ones carry genuine t dependence. The SV parity
+// check should vanish to machine precision in every direction.
+//
+// Verified MPI-decomposition and SIMD-layout independent: 4^3x8, Ls=10
+// gives bitwise identical VV on all 32 (mu,t) points for
+//   --mpi 1.1.1.1                            (default SIMD 1.1.2.2)
+//   --mpi 1.1.1.1 --simd 1.2.1.2
+//   --mpi 1.1.2.1 --simd 1.2.1.2  (2 ranks, Z split across ranks)
+//
 #include <Grid/Grid.h>
 
 using namespace std;
@@ -82,7 +93,21 @@ int main(int argc, char **argv)
 
   const int Ls = 10;
 
-  GridCartesian         *UGrid   = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(), GridDefaultSimd(Nd, vComplex::Nsimd()), GridDefaultMpi());
+  // Optional --simd override, e.g. "--simd 1.2.1.2". The default layout
+  // (1.1.2.2 for Nsimd=4) vectorises Z and T; combined with an MPI split
+  // of the same direction on a small lattice the reduced dimension can
+  // become odd, which red/black checkerboarding forbids. Moving the SIMD
+  // vectorisation off the MPI-split direction fixes that without needing
+  // a larger volume.
+  Coordinate simd_layout = GridDefaultSimd(Nd, vComplex::Nsimd());
+  if (GridCmdOptionExists(argv, argv + argc, "--simd")) {
+    std::string arg = GridCmdOptionPayload(argv, argv + argc, "--simd");
+    GridCmdOptionIntVector(arg, simd_layout);
+  }
+  std::cout << GridLogMessage << "SIMD layout : " << simd_layout
+            << "   MPI layout : " << GridDefaultMpi() << std::endl;
+
+  GridCartesian         *UGrid   = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(), simd_layout, GridDefaultMpi());
   GridRedBlackCartesian  *UrbGrid = SpaceTimeGrid::makeFourDimRedBlackGrid(UGrid);
   GridCartesian          *FGrid   = SpaceTimeGrid::makeFiveDimGrid(Ls, UGrid);
   GridRedBlackCartesian  *FrbGrid = SpaceTimeGrid::makeFiveDimRedBlackGrid(Ls, UGrid);
@@ -130,27 +155,43 @@ int main(int argc, char **argv)
     }
   }
 
-  const int mu_J = Tdir;
-  Gamma gT(Gamma::Algebra::GammaT);
+  // Conserved vector current in all four directions: the three spatial
+  // ones (Xdir, Ydir, Zdir) as well as time (Tdir). The local vertex
+  // gamma_mu at the source is matched to the conserved current's own
+  // direction in each case.
+  Gamma::Algebra Gmu_alg[] = {
+    Gamma::Algebra::GammaX,
+    Gamma::Algebra::GammaY,
+    Gamma::Algebra::GammaZ,
+    Gamma::Algebra::GammaT,
+  };
+  const char *mu_name[] = {"X", "Y", "Z", "T"};
 
-  LatticePropagator C_mu(UGrid);
-  Ddwf.ContractMobiusConservedCurrent(G, G, C_mu, mu_J);
+  for (int mu_J = 0; mu_J < Nd; mu_J++) {
 
-  LatticeComplex SV(UGrid), VV(UGrid);
-  SV = trace(C_mu);
-  VV = trace(gT * C_mu);
+    Gamma gmu(Gmu_alg[mu_J]);
 
-  std::vector<TComplex> sumSV, sumVV;
-  sliceSum(SV, sumSV, Tdir);
-  sliceSum(VV, sumVV, Tdir);
+    LatticePropagator C_mu(UGrid);
+    Ddwf.ContractMobiusConservedCurrent(G, G, C_mu, mu_J);
 
-  const int Nt = static_cast<int>(sumSV.size());
-  std::cout << GridLogMessage << "Conserved-local vector current 2pt function (mu=" << mu_J << ")" << std::endl;
-  std::cout << GridLogMessage << "Parity check: SV should be ~0 at every timeslice" << std::endl;
-  for (int t = 0; t < Nt; t++) {
-    std::cout << GridLogMessage << " t " << t
-              << " SV " << real(TensorRemove(sumSV[t]))
-              << " VV " << real(TensorRemove(sumVV[t])) << std::endl;
+    LatticeComplex SV(UGrid), VV(UGrid);
+    SV = trace(C_mu);          // scalar-vector: vanishes by parity
+    VV = trace(gmu * C_mu);    // local-vector x conserved-vector
+
+    std::vector<TComplex> sumSV, sumVV;
+    sliceSum(SV, sumSV, Tdir);
+    sliceSum(VV, sumVV, Tdir);
+
+    const int Nt = static_cast<int>(sumSV.size());
+    std::cout << GridLogMessage << "=======================================" << std::endl;
+    std::cout << GridLogMessage << "Conserved-local vector current 2pt function, mu = "
+              << mu_name[mu_J] << " (" << mu_J << ")" << std::endl;
+    std::cout << GridLogMessage << "Parity check: SV should be ~0 at every timeslice" << std::endl;
+    for (int t = 0; t < Nt; t++) {
+      std::cout << GridLogMessage << " t " << t
+                << " SV " << real(TensorRemove(sumSV[t]))
+                << " VV " << real(TensorRemove(sumVV[t])) << std::endl;
+    }
   }
 
   Grid_finalize();
