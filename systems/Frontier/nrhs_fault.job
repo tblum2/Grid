@@ -1,0 +1,128 @@
+#!/bin/bash -l
+#SBATCH --job-name=nrhs-fault
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --cpus-per-task=7
+#SBATCH --gpus-per-node=8
+#SBATCH --time=0:45:00
+#SBATCH --account=phy157_dwf
+#SBATCH --gpu-bind=none
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH -S 0
+#SBATCH -q debug
+
+##############################################################################
+# GPU "Memory access fault ... Reason: Unknown" in the 3-level example,
+# 2026-08-27/28: NRHS=12 and NRHS=6 (adaptive gcr/gcr) deep in the solve; once
+# at Nrhs=1 after an Nrhs=4 solve (replay cell S6).  NRHS=4 has never faulted.
+# --debug-signals catches nothing: the fault is raised by the ROCm runtime,
+# asynchronously, possibly long after the offending kernel/copy was queued.
+#
+# Plan: a 1-node reproducer (debug queue, minutes), then make the fault
+# ATTRIBUTABLE.  AMD_SERIALIZE_KERNEL=3 / AMD_SERIALIZE_COPY=3 make every
+# kernel launch and copy synchronous, so the fault surfaces at the call that
+# caused it; AMD_LOG_LEVEL=3 prints each kernel's name as it launches, so the
+# last name before the fault is the culprit.  ~5-10x slower: fine at this size.
+#
+# Cells:  F0 NRHS=4 control  |  F1 NRHS=6 (reproduce?)  |  F2 NRHS=6 serialised
+#         F3 NRHS=6 DENSE_CC=0 (no dense bottom)  |  F4 NRHS=6 --device-mem 48000 (no LRU eviction)
+# Read:   grep -n -B8 "Memory access fault" log.fault.F*  ;  for F2 the last
+#         "ShaderName"/kernel lines before the fault; F3/F4 say whether the
+#         dense bottom or MemoryManager eviction is involved.
+##############################################################################
+
+# Run in a per-job subdirectory on Lustre: logs, per-rank --debug-stdout trees and GPU
+# core files are large and must not land in $HOME (quota).  Everything below is
+# relative to RUNDIR; the job's own slurm-*.out stays where sbatch was run.
+LUSTRE=/lustre/orion/phy157/proj-shared/phy157_dwf/paboyle
+RUNDIR=$LUSTRE/runs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}
+mkdir -p $RUNDIR && cd $RUNDIR && echo "RUNDIR $RUNDIR"
+
+cat << EOF > select_gpu
+#!/bin/bash
+export GPU_MAP=(0 1 2 3 7 6 5 4)
+export NUMA_MAP=(3 3 1 1 2 2 0 0)
+export GPU=\${GPU_MAP[\$SLURM_LOCALID]}
+export NUMA=\${NUMA_MAP[\$SLURM_LOCALID]}
+export HIP_VISIBLE_DEVICES=\$GPU
+unset ROCR_VISIBLE_DEVICES
+if [ \$SLURM_PROCID = "0" ]; then echo \$*; fi
+exec numactl -m \$NUMA -N \$NUMA \$*
+EOF
+chmod +x ./select_gpu
+
+root=$HOME/ParallelIO/systems/Frontier
+source $root/sourceme-rocm7.2.sh
+
+export OMP_NUM_THREADS=7
+# No core dumps: the ROCm runtime's GPU core dump (gpucore.<pid>, ~22 GB per faulting GCD, the
+# .nfs quota disaster of 2026-08-25) obeys ulimit -c like the kernel's (ROCgdb docs, "AMD GPU
+# core dumps"); Slurm propagates the batch shell's limits to srun tasks by default.
+ulimit -c 0
+export FI_MR_CACHE_MONITOR=kdreg2       # REQUIRED for device-buffer MPI on Slingshot: libfabric memhooks monitor (default) is defective, see systems/WorkArounds.txt (libfabric #11451)
+export MPICH_GPU_SUPPORT_ENABLED=1
+export MPICH_SMP_SINGLE_COPY_MODE=CMA
+export MPICH_OFI_NIC_POLICY=GPU
+module load libfabric
+
+BIN=$root/examples/Example_pvdagm_v2_3level_DenseCoarseMatrix
+OPTS1="--accelerator-threads 8 --shm 4096 --shm-mpi 1"
+# LOCAL VOLUME MATCHED to production: 48.48.48.96 on 3.6.4.4 is local 16.8.12.24; on 8 GCDs
+# (1.1.2.4) that is global 16.8.24.96 with the production blockings 2.2.3.3 / 4.4.2.4:
+# coarse local 8.4.4.8 and coarse-coarse local 2.1.2.2 exactly as at 288 ranks.  The global
+# lattice is oddly shaped and the dense bottom is tiny (N = 2.1.4.8 x 60 = 3840, one block),
+# but every solver-side buffer has the production shape.  (First submission, 2026-08-28,
+# used 16.16.16.32 with 2^4 blocks: local 16.16.8.8 -- NOT matched.)
+vol=16.8.24.96
+MPI_GEOM=1.1.2.4
+# The example sizes its lattice from LATT/LS (env), NOT from --grid (first submission
+# asserted heap_bytes<heap_size trying to build 48^3x96 on one node for exactly this reason).
+export LATT=$vol
+export LS=24
+
+# The subspace is generated on first use and saved to SUBSPACE_FILE (a few minutes).
+export SUBSPACE_FILE=$LUSTRE/subspace_16x8x24x96_nb64.scidac   # persistent across jobs (generated once)
+unset  SLAB_FILE
+export HOT_START=1
+export MASS=0.00078
+export BLOCK=2.2.3.3
+export BLOCK2=4.4.2.4
+export DENSE_SCHUR=1
+export DENSE_SCHUR2D=1
+export DENSE_CC=1
+export DENSE_SPLITK=1
+export DENSE_DEVICE_SUM=4
+export SCHUR2D_LEAF_SPAN=1
+export SCHUR2D_LEAF_LU=1
+export SCHUR2D_PROBE=0
+export GRID_ALLOC_NCACHE_LARGE=64
+# banked adaptive solver settings
+export FineSmootherShift=0.1  FineSmootherOrder=6 FineSmootherMmax=4
+export CoarseSmootherShift=2.0 CoarseSmootherNstep=2 CoarseSmootherMmax=2
+export CoarseSolverTol=0.05 CoarseSolverOrder=200 CoarseSolverMmax=8
+export OuterTol=1e-8 OuterMmax=6 OuterNstep=12
+export PowerIterations=0 SmootherCoeffLog=0 PolyVerbose=0
+
+run_cell () {
+  name=$1; devmem=$2; shift 2
+  GRID_LOG_EXTRA=""; for kv in "$@"; do case $kv in GRID_LOG_EXTRA=*) GRID_LOG_EXTRA=${kv#GRID_LOG_EXTRA=};; esac; done
+  echo "----- $name : --device-mem $devmem  $* -----"
+  fname=log.fault.$name
+  logopt=""; [ -n "$GRID_LOG_EXTRA" ] && logopt="--log Error,Warning,Message,$GRID_LOG_EXTRA"
+  env "$@" srun -N1 -n8 --kill-on-bad-exit=1 ./select_gpu $BIN --mpi ${MPI_GEOM} --grid $vol $OPTS1 --device-mem $devmem --comms-overlap $logopt > $fname 2>&1
+  echo "  exit $?"; sleep 10
+  grep -h "V2 3-level solve\|Memory access fault\|GRID_ASSERT\|Converged on iteration" $fname | sed 's/^Grid : Message : [0-9.]* s : //' | tail -4 | cut -c1-140
+  grep -n -B3 "Memory access fault" $fname | tail -5 | cut -c1-160
+}
+
+#          name         devmem  environment
+run_cell   F0_nrhs4     16000   NRHS=4                                                     # control: never faulted at 288
+run_cell   F1_nrhs6     16000   NRHS=6                                                     # reproduce on 1 node?
+run_cell   F2_nrhs6_ser 16000   NRHS=6 AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3 AMD_LOG_LEVEL=3 GRID_LOG_EXTRA=Memory   # attributable fault
+run_cell   F3_nrhs6_nodense 16000 NRHS=6 DENSE_CC=0                                        # dense bottom out of the loop
+run_cell   F4_nrhs6_bigmem 48000 NRHS=6                                                    # no MemoryManager eviction
+
+echo "========================================================="
+for f in log.fault.F*; do echo "$f: $(grep -c 'Memory access fault' $f) faults; $(grep -h 'V2 3-level solve' $f | tail -1 | sed 's/.*V2/V2/' | cut -c1-60)"; done
+echo "========================================================="

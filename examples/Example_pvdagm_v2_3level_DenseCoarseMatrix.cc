@@ -93,6 +93,22 @@ int   FineSmootherOrder    = 6;
 int   FineSmootherMmax     = 6;
 RealD CoarseSmootherShift  = 0.1;
 int   PowerIterations      = 0;     // >0: power-iterate the smoother operators before the solves (spectral edge)
+// Smoother implementation per level (Smoothers.h):
+//   gcr    : the adaptive PGCR (default, as always)
+//   replay : run the PGCR with a coefficient recorder for the first
+//            PolyRecordIters outer steps, then switch to GCRReplaySmoother
+//            (same polynomial, no inner products) -- 1402.2585 p.13 revisited
+//   cheb   : ChebyshevNonHermitianSmoother, 1/x on [ChebLo,ChebHi], order
+//            = the GCR step count of that level
+std::string FineSmootherMode   = "gcr";
+std::string CoarseSmootherMode = "gcr";
+int   PolyRecordIters      = 4;
+int   PolyRecordStart      = 0;     // outer step at which recording begins (0: from the first step)
+std::string PolyRecordSelect = "last"; // which recorded call to replay: last|first|mean (mean is the bad one)
+int   PolyRefresh          = 0;     // >0: every PolyRefresh outer steps, one adaptive step re-records the polynomial (HDCG: every 10)
+int   PolyVerbose          = 0;     // 1: fixed-polynomial smoothers print |r_m|/|r_0| per call
+RealD FineChebLo   = 3.0,  FineChebHi   = 137.0;   // from the harvested polynomial and PowerIterations edge
+RealD CoarseChebLo = 8.0,  CoarseChebHi = 45.0;
 int   CoarseSmootherNstep  = 2;
 int   CoarseSmootherMmax   = 2;
 RealD CoarseSolverTol      = 0.05;
@@ -137,6 +153,17 @@ void ParseEnvironment(void)
   if(getenv("FineSmootherMmax"))   FineSmootherMmax   = atoi(getenv("FineSmootherMmax"));
   if(getenv("CoarseSmootherShift"))CoarseSmootherShift= atof(getenv("CoarseSmootherShift"));
   if(getenv("PowerIterations"))    PowerIterations    = atoi(getenv("PowerIterations"));
+  if(getenv("FineSmootherMode"))   FineSmootherMode   = getenv("FineSmootherMode");
+  if(getenv("CoarseSmootherMode")) CoarseSmootherMode = getenv("CoarseSmootherMode");
+  if(getenv("PolyRecordIters"))    PolyRecordIters    = atoi(getenv("PolyRecordIters"));
+  if(getenv("PolyRecordStart"))    PolyRecordStart    = atoi(getenv("PolyRecordStart"));
+  if(getenv("PolyRecordSelect"))   PolyRecordSelect   = getenv("PolyRecordSelect");
+  if(getenv("PolyRefresh"))        PolyRefresh        = atoi(getenv("PolyRefresh"));
+  if(getenv("PolyVerbose"))        PolyVerbose        = atoi(getenv("PolyVerbose"));
+  if(getenv("FineChebLo"))         FineChebLo         = atof(getenv("FineChebLo"));
+  if(getenv("FineChebHi"))         FineChebHi         = atof(getenv("FineChebHi"));
+  if(getenv("CoarseChebLo"))       CoarseChebLo       = atof(getenv("CoarseChebLo"));
+  if(getenv("CoarseChebHi"))       CoarseChebHi       = atof(getenv("CoarseChebHi"));
   if(getenv("CoarseSmootherNstep"))CoarseSmootherNstep= atoi(getenv("CoarseSmootherNstep"));
   if(getenv("CoarseSmootherMmax")) CoarseSmootherMmax = atoi(getenv("CoarseSmootherMmax"));
   if(getenv("CoarseSolverTol"))    CoarseSolverTol    = atof(getenv("CoarseSolverTol"));
@@ -161,6 +188,27 @@ void ParseEnvironment(void)
   std::cout << GridLogMessage << "PARAM: NBASIS             " << NBASIS       << std::endl;
   std::cout << GridLogMessage << "PARAM: NRHS               " << Nrhs         << std::endl;
   std::cout << GridLogMessage << "PARAM: COARSEN_BATCH      " << CoarsenBatch << std::endl;
+  // EVERY knob this programme parsed, so a log identifies its own run (2026-08-28:
+  // four jobs in the queue differing in FineSloppyComms/NRHS/mmax and none of it
+  // printed).  Interim until the Serializable parameter struct replaces all of this.
+  auto P = [](const char *n, auto v){ std::cout << GridLogMessage << "PARAM: " << std::left << std::setw(20) << n << std::right << " " << v << std::endl; };
+  P("FineSmootherShift",FineSmootherShift);   P("FineSmootherOrder",FineSmootherOrder);   P("FineSmootherMmax",FineSmootherMmax);
+  P("FineSmootherMode",FineSmootherMode);     P("FineChebLo",FineChebLo);                 P("FineChebHi",FineChebHi);
+  P("FineSloppyComms",FineSloppyComms);
+  P("CoarseSmootherShift",CoarseSmootherShift); P("CoarseSmootherNstep",CoarseSmootherNstep); P("CoarseSmootherMmax",CoarseSmootherMmax);
+  P("CoarseSmootherMode",CoarseSmootherMode); P("CoarseChebLo",CoarseChebLo);             P("CoarseChebHi",CoarseChebHi);
+  P("CoarseSolverTol",CoarseSolverTol);       P("CoarseSolverOrder",CoarseSolverOrder);   P("CoarseSolverMmax",CoarseSolverMmax);
+  P("OuterTol",OuterTol);                     P("OuterMmax",OuterMmax);                   P("OuterNstep",OuterNstep);
+  P("PowerIterations",PowerIterations);       P("PolyRecordIters",PolyRecordIters);       P("PolyRecordStart",PolyRecordStart);
+  P("PolyRecordSelect",PolyRecordSelect);     P("PolyRefresh",PolyRefresh);               P("PolyVerbose",PolyVerbose);
+  P("SmootherCoeffLog",SmootherCoeffLog);
+  // library-side and runtime knobs, read straight from the environment as the library will
+  const char *envs[] = {"BLOCK","BLOCK2","SUBSPACE_FILE","CONFIG","HOT_START","MRHS_COARSEN","V1_CHECK",
+                        "DENSE_CC","DENSE_SCHUR","DENSE_SCHUR2D","DENSE_DEVICE_SUM","DENSE_SPLITK","DENSE_NB",
+                        "SCHUR2D_LEAF_SPAN","SCHUR2D_LEAF_LU","SCHUR2D_PROBE","SUMMA_HANDSHAKE","DENSE_APPLY_PROFILE","SLAB_FILE",
+                        "SOLVE_SRHS","GRID_ALLOC_NCACHE_LARGE","OMP_NUM_THREADS",
+                        "MPICH_GPU_SUPPORT_ENABLED","FI_MR_CACHE_MONITOR","FI_MR_CACHE_MAX_COUNT","AMD_SERIALIZE_KERNEL","AMD_LOG_LEVEL"};
+  for(auto e : envs) P(e, getenv(e) ? std::string(getenv(e)) : std::string("(unset)"));
 }
 
 template <class Field>
@@ -346,6 +394,7 @@ public:
   std::string name = "Level 1";
   LinearOperatorBase<Field> &Linop;
   MrhsLinearFunction<Field> &Preconditioner;
+  std::function<void(int)> OnStep;      // called with the outer step count after every step (smoother switching)
   void Level(int lv){ name = "Level " + std::to_string(lv); level=lv; }
   void Name(std::string n){ name = n; }
   void SetZeroGuess(int z){ ZeroGuess=z; }
@@ -387,6 +436,7 @@ public:
     Preconditioner(r,p[0]); vOp(p[0],q[0]); qq[0]=vnorm2(q[0]); cp=vnorm2(r);
     for(int k=0;k<nstep;k++){
       steps++; int kp=k+1, peri_k=k%mmax, peri_kp=kp%mmax;
+      if ( OnStep ) OnStep(steps);
       rq=vinnerProduct(q[peri_k],r); a=rq/qq[peri_k];
       vaxpy(psi,a,p[peri_k],psi); vaxpy(r,-a,q[peri_k],r); cp=vnorm2(r);
       std::cout<<GridLogMessage<<std::string(level,'\t')<<" "<<name<<" MrhsPGCR step["<<steps<<"]  resid "<<cp<<" target "<<rsq<<std::endl;
@@ -679,23 +729,9 @@ int main (int argc, char ** argv)
   }
   SetFineSloppy(0);
 
-  // Stay on the batch grid: the L2 coarsening drives this operator at the
-  // batch. It is switched to the solve Nrhs once L2 is built.
-
-  //////////////////////////////////////////////////////////////////////
-  // psi_coarse = P^dag (RAW fine null) -> Galerkin images that carry the
-  // near null content, and are free: A_c (P psi) = P A psi.
-  //////////////////////////////////////////////////////////////////////
-  MultiRHSBlockProject<LatticeFermionD> MrhsProjector;
-  MrhsProjector.Allocate(nbasis,FGrid,Coarse5d);
-  MrhsProjector.ImportBasis(AggregatesGCR.subspace);   // block orthonormal basis
-
-  std::vector<CoarseVector> psi_coarse(nbasis,Coarse5d);
-  MrhsProjector.blockProject(rawNull,psi_coarse);      // RAW vectors in
-  rawNull.clear(); rawNull.shrink_to_fit();
-
-  GramGuard("psi_coarse",psi_coarse,Coarse5d);
-
+  // (moved here 2026-08-28: it needs AggregatesGCR.subspace, which is freed right after
+  //  the projector imports it below -- the 60 fine vectors are 20 GB of host memory per
+  //  rank and 60 LRU-eligible device fields competing with the solver's working set)
   //////////////////////////////////////////////////////////////////////
   // Optional cross check of the coarse matrix elements against the V1
   // path, which needs a vectorised coarse space. Block Gram-Schmidt is
@@ -756,6 +792,27 @@ int main (int argc, char ** argv)
     GRID_ASSERT( den > 0.0 );
     GRID_ASSERT( num/den < 1.0e-18 );
   }
+
+  // Stay on the batch grid: the L2 coarsening drives this operator at the
+  // batch. It is switched to the solve Nrhs once L2 is built.
+
+  //////////////////////////////////////////////////////////////////////
+  // psi_coarse = P^dag (RAW fine null) -> Galerkin images that carry the
+  // near null content, and are free: A_c (P psi) = P A psi.
+  //////////////////////////////////////////////////////////////////////
+  MultiRHSBlockProject<LatticeFermionD> MrhsProjector;
+  MrhsProjector.Allocate(nbasis,FGrid,Coarse5d);
+  MrhsProjector.ImportBasis(AggregatesGCR.subspace);   // block orthonormal basis
+  // The basis now lives in the projector's BLAS_V (device); nothing after this
+  // point reads AggregatesGCR.subspace (V1_CHECK moved above).  Free it: 60 fine
+  // fields = 20 GB host per rank, and 60 LRU-eligible device copies.
+  AggregatesGCR.subspace.clear(); AggregatesGCR.subspace.shrink_to_fit();
+
+  std::vector<CoarseVector> psi_coarse(nbasis,Coarse5d);
+  MrhsProjector.blockProject(rawNull,psi_coarse);      // RAW vectors in
+  rawNull.clear(); rawNull.shrink_to_fit();
+
+  GramGuard("psi_coarse",psi_coarse,Coarse5d);
 
   //////////////////////////////////////////////////////////////////////
   // STAGE TWO: L2 -> L3.
@@ -911,6 +968,32 @@ int main (int argc, char ** argv)
   {
     std::cout << GridLogMessage << "**********************************************" << std::endl;
     std::cout << GridLogMessage << " V2 THREE-level solve, Nrhs = " << nr << std::endl;
+    // Device-memory budget BEFORE the solve (2026-08-28: NRHS=6 died in hipMalloc at the
+    // first fine-smoother history allocation -- reported as an asynchronous "memory
+    // access fault" unless AMD_SERIALIZE_KERNEL/COPY made it a clean OOM).  The outer
+    // mRHS GCR holds src, sol, r, Az and OuterMmax x (p,q) fine fields PER RHS; the fine
+    // smoother adds FineSmootherMmax x (p,q) once.  The MemoryManager LRU cap
+    // (--device-mem) must be BELOW what is physically left after the non-LRU allocations
+    // (comms buffers, dense slab, stencil buffers), or the device fills before anything
+    // is evicted.  Print the estimate, the LRU state, and the device's own free count.
+    {
+      uint64_t fieldBytes = (uint64_t)FGrid->lSites()*sizeof(typename LatticeFermionD::scalar_object);
+      double outerGB = (double)nr*(4 + 2*OuterMmax)*fieldBytes/1.0e9;
+      double smthGB  = (double)(2*FineSmootherMmax + 4)*fieldBytes/1.0e9;
+      std::cout << GridLogMessage << "Device budget: fine field " << fieldBytes/1.0e6 << " MB; outer GCR history "
+                << nr << " x (4 + 2 x " << OuterMmax << ") fields = " << outerGB << " GB; fine smoother history + temps ~ "
+                << smthGB << " GB; MemoryManager device LRU " << MemoryManager::DeviceCacheBytes()/1.0e9 << " GB now, cap "
+                << MemoryManager::DeviceMaxBytes/1.0e9 << " GB" << std::endl;
+      // Empty the device LRU: every setup-era Lattice copy (coarse null vectors,
+      // coarsening temporaries) goes back to host, so the solve's working set
+      // starts from a clean device and the cap applies to it alone.
+      MemoryManager::EvictAll();
+      // ...and release the allocation caches' held blocks (setup-era deviceVector
+      // scratch that is "free" to the caller but not to hipMalloc).
+      MemoryManager::DropCache();
+      MemoryManager::PrintBytes();
+      acceleratorMem();
+    }
     std::cout << GridLogMessage << "**********************************************" << std::endl;
 
     Coordinate cml({nr,1,clatt[0],clatt[1],clatt[2],clatt[3]});
@@ -938,8 +1021,9 @@ int main (int argc, char ** argv)
       CoarseSmootherGCR(0.01,1,ShiftedC,simpleC,CoarseSmootherMmax,CoarseSmootherNstep);
     CoarseSmootherGCR.Level(2); CoarseSmootherGCR.Name("Csmoother"); CoarseSmootherGCR.SetZeroGuess(1);
 
+    SwitchableSmoother<CoarseVector> CoarseSmootherSlot(CoarseSmootherGCR,"Csmoother GCR");
     MrhsCoarseThreeLevelPrec<CoarseVector,CoarseCoarseVector>
-      L2to3Precon(LinOpC, CoarseSmootherGCR, MrhsProjectorL2, ccSolve,
+      L2to3Precon(LinOpC, CoarseSmootherSlot, MrhsProjectorL2, ccSolve,
                   Coarse5d, CoarseCoarse5d, CCMrhs, nr);
 
     PrecGeneralisedConjugateResidualNonHermitian<CoarseVector>
@@ -951,12 +1035,91 @@ int main (int argc, char ** argv)
     SmootherGCR.LogCoefficients(SmootherCoeffLog);
     CoarseSmootherGCR.LogCoefficients(SmootherCoeffLog);
 
-    MrhsTwoLevelMG<LatticeFermionD,CoarseVector,FineSmoother_t>
-      ThreeLevelPrecon(PVdagM, SmootherGCR, MrhsProjector, L2PGCR, Coarse5d, CMrhs);
+    SwitchableSmoother<LatticeFermionD> FineSmootherSlot(SmootherGCR,"Fsmoother GCR");
+    MrhsTwoLevelMG<LatticeFermionD,CoarseVector,SwitchableSmoother<LatticeFermionD> >
+      ThreeLevelPrecon(PVdagM, FineSmootherSlot, MrhsProjector, L2PGCR, Coarse5d, CMrhs);
 
     MrhsPGCRNonHermitian<LatticeFermionD>
       L1PGCR(OuterTol,1000,PVdagM,ThreeLevelPrecon,OuterMmax,OuterNstep);
     L1PGCR.Level(1); L1PGCR.Name("Fouter"); L1PGCR.SetZeroGuess(1);
+
+    //////////////////////////////////////////////////////////////////////
+    // Smoother modes.  Objects live for the duration of this RunSolve.
+    //////////////////////////////////////////////////////////////////////
+    std::unique_ptr<ChebyshevNonHermitianSmoother<LatticeFermionD> > FineCheb;
+    std::unique_ptr<ChebyshevNonHermitianSmoother<CoarseVector> >    CoarseCheb;
+    std::unique_ptr<GCRReplaySmoother<LatticeFermionD> > FineReplay;
+    std::unique_ptr<GCRReplaySmoother<CoarseVector> >    CoarseReplay;
+    GCRCoefficients recF, recC;
+    {
+      GCRCoefficients::Select sel = GCRCoefficients::Last;
+      if ( PolyRecordSelect=="first" ) sel = GCRCoefficients::First;
+      if ( PolyRecordSelect=="mean" )  sel = GCRCoefficients::Mean;
+      recF.select = sel; recC.select = sel;
+    }
+    if ( FineSmootherMode == "cheb" ) {
+      FineCheb.reset(new ChebyshevNonHermitianSmoother<LatticeFermionD>(FineChebLo,FineChebHi,FineSmootherOrder,ShiftedPVdagM));
+      FineCheb->Verbose = PolyVerbose; FineCheb->name = "Fsmoother";
+      FineSmootherSlot.Set(*FineCheb,"Fsmoother Chebyshev");
+    }
+    if ( CoarseSmootherMode == "cheb" ) {
+      CoarseCheb.reset(new ChebyshevNonHermitianSmoother<CoarseVector>(CoarseChebLo,CoarseChebHi,CoarseSmootherNstep,ShiftedC));
+      CoarseCheb->Verbose = PolyVerbose; CoarseCheb->name = "Csmoother";
+      CoarseSmootherSlot.Set(*CoarseCheb,"Csmoother Chebyshev");
+    }
+    // Recording window [PolyRecordStart, PolyRecordStart+PolyRecordIters).
+    // M3 (2026-08-26): the GCR polynomial changes fast over the first outer
+    // steps (per-call |r|/|r0| 0.0034 -> 0.017 over steps 1-4) and the MEAN
+    // of those is a poor smoother (replay 0.033-0.049 per call); record a
+    // settled window instead.
+    if ( PolyRecordStart == 0 ) {
+      if ( FineSmootherMode   == "replay" ) SmootherGCR.SetCoefficientRecorder(&recF);
+      if ( CoarseSmootherMode == "replay" ) CoarseSmootherGCR.SetCoefficientRecorder(&recC);
+    }
+    // Record -> replay, with optional periodic re-recording ("re-record, not
+    // fade away": HDCG refreshed its polynomial every 10 steps, tracking the
+    // evolving spectral content of the residual).  Schedule on outer steps:
+    //   [PolyRecordStart, +PolyRecordIters)          adaptive GCR, recording
+    //   then replay of the selected recorded call;
+    //   if PolyRefresh>0: every PolyRefresh steps, ONE adaptive recording
+    //   step, then replay of that call.
+    auto BuildReplays = [&](void){
+      if ( FineSmootherMode == "replay" ) {
+        SmootherGCR.SetCoefficientRecorder(nullptr);
+        recF.Flush(); recF.Report("Fsmoother");
+        FineReplay.reset(new GCRReplaySmoother<LatticeFermionD>(ShiftedPVdagM,recF));
+        FineReplay->Verbose = PolyVerbose; FineReplay->name = "Fsmoother";
+        FineSmootherSlot.Set(*FineReplay,"Fsmoother replay");
+        SmootherGCR.ReleaseHistory();
+      }
+      if ( CoarseSmootherMode == "replay" ) {
+        CoarseSmootherGCR.SetCoefficientRecorder(nullptr);
+        recC.Flush(); recC.Report("Csmoother");
+        CoarseReplay.reset(new GCRReplaySmoother<CoarseVector>(ShiftedC,recC));
+        CoarseReplay->Verbose = PolyVerbose; CoarseReplay->name = "Csmoother";
+        CoarseSmootherSlot.Set(*CoarseReplay,"Csmoother replay");
+        CoarseSmootherGCR.ReleaseHistory();
+      }
+    };
+    auto StartRecording = [&](int step){
+      if ( FineSmootherMode   == "replay" ) { { auto sel=recF.select; recF = GCRCoefficients(); recF.select=sel; } SmootherGCR.SetCoefficientRecorder(&recF);       FineSmootherSlot.Set(SmootherGCR,"Fsmoother GCR (recording)"); }
+      if ( CoarseSmootherMode == "replay" ) { { auto sel=recC.select; recC = GCRCoefficients(); recC.select=sel; } CoarseSmootherGCR.SetCoefficientRecorder(&recC); CoarseSmootherSlot.Set(CoarseSmootherGCR,"Csmoother GCR (recording)"); }
+      std::cout << GridLogMessage << "Smoother coefficient recording starts at outer step " << step << std::endl;
+    };
+    int switchStep = PolyRecordStart + PolyRecordIters;
+    L1PGCR.OnStep = [&](int step){
+      if ( FineSmootherMode != "replay" && CoarseSmootherMode != "replay" ) return;
+      if ( step == PolyRecordStart && PolyRecordStart > 0 ) StartRecording(step);
+      if ( step == switchStep ) { BuildReplays(); return; }
+      if ( PolyRefresh > 0 && step > switchStep ) {
+        int since = step - switchStep;
+        if ( since % PolyRefresh == 0 )     { StartRecording(step); }       // one adaptive, recorded step
+        if ( since % PolyRefresh == 1 )     { BuildReplays(); }             // then replay it
+      }
+    };
+    std::cout << GridLogMessage << "Smoother modes: fine " << FineSmootherMode << "  coarse " << CoarseSmootherMode
+              << (FineSmootherMode=="replay"||CoarseSmootherMode=="replay" ? "  (record outer steps "+std::to_string(PolyRecordStart)+".."+std::to_string(PolyRecordStart+PolyRecordIters)+")" : "")
+              << std::endl;
 
     std::vector<LatticeFermionD> src(nr,FGrid), sol(nr,FGrid);
     for(int r=0;r<nr;r++){ gaussian(RNG5,src[r]); sol[r]=Zero(); }

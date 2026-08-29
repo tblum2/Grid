@@ -76,6 +76,13 @@ static ComplexD Fill(int64_t i, int64_t j, int64_t N)
 
 int main(int argc, char **argv)
 {
+  // Environment walk (2026-08-27, systems/Frontier/schur2d_env.job): knobs to
+  // reproduce the example's environment here, one at a time.  Result: thread
+  // level, OMP_NUM_THREADS, device residency and sustained load all NIL; only
+  // "first job step on fresh nodes" (+3 s) is real.
+  //   S2D_BALLAST_GB=x     x GB of Lattice fields made device-resident before the invert
+  //   S2D_PREHEAT_S=x      x seconds of back-to-back zgemm before the invert
+  //   OMP_NUM_THREADS      set in the job, read by nothing here but the runtime
   Grid_init(&argc, &argv);
 
   GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(),
@@ -124,6 +131,49 @@ int main(int argc, char **argv)
   BlockCyclicMatrix A (grid,N,nb,Pr,Pc);
   BlockCyclicMatrix A0(grid,N,nb,Pr,Pc);
   BlockCyclicSchurInverse RSI2;
+
+  // Pre-heat: drive the GCD with back-to-back zgemm for S2D_PREHEAT_S seconds
+  // before the invert.  The example calls the inverse after ~100 s of full
+  // load on all 288 GCDs and its LOCAL kernels run 20-40% slower than the
+  // idle-start harness (GEMM 3.1 vs 2.5 s, leaf 0.76 vs 0.24 s) with the
+  // wires unchanged; thread level / OMP / residency (E1-E5) did not reproduce
+  // that.  If sustained load does, it is clock/power management, not code.
+  if ( getenv("S2D_PREHEAT_S") ) {
+    double secs = atof(getenv("S2D_PREHEAT_S"));
+    const int64_t W = 4320;
+    deviceVector<ComplexD> M((uint64_t)W*W), C((uint64_t)W*W);
+    { ComplexD *m = &M[0]; accelerator_for(idx,(uint64_t)W*W,1,{ m[idx] = ComplexD(1.0e-3*(idx%97),1.0e-3*(idx%89)); }); accelerator_barrier(); }
+    deviceVector<ComplexD*> ap(1),bp(1),cp(1); std::vector<ComplexD*> ptr(1);
+    ptr[0]=&M[0]; acceleratorCopyToDevice(&ptr[0],&ap[0],sizeof(ComplexD*)); acceleratorCopyToDevice(&ptr[0],&bp[0],sizeof(ComplexD*));
+    ptr[0]=&C[0]; acceleratorCopyToDevice(&ptr[0],&cp[0],sizeof(ComplexD*));
+    double t0=usecond(); int n=0; double tlast=0;
+    while ( (usecond()-t0)/1.0e6 < secs ) {
+      double t1=usecond();
+      RSI2.SUMMA.BLAS.gemmBatched(GridBLAS_OP_N,GridBLAS_OP_N,(int)W,(int)W,(int)W,ComplexD(1.0,0.0),ap,(int)W,bp,(int)W,ComplexD(0.0,0.0),cp,(int)W);
+      RSI2.SUMMA.BLAS.synchronise(); tlast=usecond()-t1; n++;
+    }
+    double tfirst = 0; (void)tfirst;
+    std::cout << GridLogMessage << "Test_schur2d_scale: pre-heat " << (usecond()-t0)/1.0e6 << " s, " << n << " zgemm W=" << W
+              << ", last zgemm " << tlast/1.0e6 << " s (" << 8.0*W*W*W/tlast/1.0e6 << " TF/s; idle-start rate 23.7)" << std::endl;
+  }
+
+  // Device ballast: Lattice fields written on the accelerator so they sit in
+  // the MemoryManager's device LRU exactly as the example's fine-grid state does.
+  typedef Lattice<iVector<iVector<vComplexD,Nc>,Ns> > BallastField;
+  std::vector<BallastField> ballast;
+  if ( getenv("S2D_BALLAST_GB") ) {
+    double gb = atof(getenv("S2D_BALLAST_GB"));
+    uint64_t fbytes = (uint64_t)grid->oSites()*sizeof(BallastField::vector_object);
+    int nf = (int)(gb*1.0e9/(double)fbytes + 0.5);
+    ballast.reserve(nf);
+    for(int i=0;i<nf;i++){
+      ballast.emplace_back(grid);
+      autoView(v, ballast[i], AcceleratorWriteDiscard);
+      accelerator_for(ss, grid->oSites(), 1, { v[ss] = Zero(); });
+    }
+    std::cout << GridLogMessage << "Test_schur2d_scale: device ballast " << nf << " fields x " << fbytes/1.0e6
+              << " MB = " << nf*fbytes/1.0e9 << " GB resident (S2D_BALLAST_GB=" << gb << ")" << std::endl;
+  }
 
   BlockCyclicRedistribute::RowsToCyclic(grid,rowStart,&rows1d[0],myrows,A);
   double t2 = usecond();

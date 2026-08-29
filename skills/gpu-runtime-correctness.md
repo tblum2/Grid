@@ -99,3 +99,57 @@ Grid uses `computeStream` (CUDA/HIP) or `theGridAccelerator` (SYCL) consistently
 3. If results are non-deterministic across runs, insert a second barrier and observe whether reproducibility improves.
 4. For correctness-critical operations (reductions that will be compared against reference values), add the double-run checksum test from `correctness-verification.md`.
 5. If the process hangs at 100% CPU in a runtime library function, this is a driver/runtime bug — there is no application-level fix beyond scheduling a node reboot.
+
+## Making an asynchronous GPU fault attributable
+
+A "Memory access fault by GPU node-N ... Reason: Unknown" is raised by the
+runtime, asynchronously, possibly long after the offending kernel or copy
+was *queued*.  `--debug-signals` sees nothing useful: the host is elsewhere
+by then.  Before exhaustive logging or bisection, make the fault land on the
+call that caused it:
+
+| runtime | serialise launches/copies | name kernels as they launch |
+|---|---|---|
+| HIP/ROCm | `AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3` (every launch and copy synchronous) | `AMD_LOG_LEVEL=3` (4 is very verbose) |
+| CUDA | `CUDA_LAUNCH_BLOCKING=1` | `compute-sanitizer --tool memcheck ./bin ...` (names the kernel and the bad address) |
+| SYCL/L0 | `SYCL_PI_TRACE=2` / `ZE_DEBUG=1` | (Level Zero validation layer: `ZE_ENABLE_VALIDATION_LAYER=1`) |
+
+5-10x slower, so run on the smallest reproducer (one node, small lattice).
+The last kernel name printed before the fault is the culprit; combined with
+Grid's `--log ...,Memory` (every MemoryManager transfer with size, direction,
+device and host pointers, in program order) it separates "stale pointer after
+eviction" from "out-of-range index" in one run.  First used 2026-08-28 for the
+NRHS>=6 fault in the 3-level example (`systems/Frontier/nrhs_fault.job`).
+
+**GPU core dumps (ROCm):** on a fault the runtime writes `gpucore.<pid>` (a
+GCD's memory, ~22 GB on MI250X) into the process's working directory; it obeys
+`ulimit -c` exactly as the kernel core does, so `ulimit -c 0` in the batch
+script suppresses it (Slurm propagates rlimits to `srun` tasks by default) and
+`ulimit -c unlimited` + `HSA_ENABLE_DEBUG=1` produces one ROCgdb can load.
+Deleted-while-open dumps on NFS persist as hidden `.nfs*` files against quota
+until the holder exits.  Run fault hunts from a Lustre directory.
+Source: ROCgdb documentation, "AMD GPU" chapter, core-dump section.
+
+## Attributing memory corruption in stripped vendor libraries: the watchpoint
+
+When code you cannot read (MPI, libfabric, driver: stripped, no debug info) corrupts
+something, source-level breakpoints are useless.  The tools that need no source
+(libfabric #11451, PB, aarch64 PLT corruption at MPI_Init, is the worked example):
+
+1. Find the corrupted word: `p/x *(uint32_t *)0x408ed0` before and after the suspect
+   call; compare with the binary's own disassembly (`objdump -d`, or `layout asm`).
+2. `watch *0x408ed0` (hardware watchpoint on the ADDRESS, not a breakpoint on a
+   function), then run the suspect call: the trap fires at the instruction that writes.
+3. `bt` at the trap names the writer and its arguments (there: `ofi_write_patch(
+   data_size=2876502996, address=<munmap@plt>)` -- a garbage length overrunning into
+   the next PLT entry).
+4. `layout asm` + `info registers` at the later crash show the mechanism (`br x15` with
+   x15=0x10 where an `adrp` belonged); `info symbol <addr>` names stray addresses.
+5. Trace the written opcode back to the library's source if you have it (0xd61f01e0 =
+   libfabric's `br(15)` in util_mem_hooks.c) -- irrefutable.
+6. Make it reproducible where a debugger attaches: `MPICH_SINGLE_HOST_ENABLED=0`
+   forces the CXI/fabric path on ONE node.
+
+Report standard (PB, from EDA/QCDOC/BG-Q QA): symptom -> instrument -> the line ->
+the fix.  A report without the mechanism is noise; one with it gets an HPE JIRA the
+same day.  Fix for the above: `FI_MR_CACHE_MONITOR=kdreg2` (see systems/WorkArounds.txt).

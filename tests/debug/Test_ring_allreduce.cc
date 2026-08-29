@@ -26,6 +26,7 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //   T2 cartesian ring == GlobalSumVector, same sweep
 //   T3 bitwise repeatable (deterministic order)
 //   T4 timing at 16 MB, both rings vs GlobalSumVector
+//   T5 CartesianRingAllGather bitwise == padded GlobalSumVector; timing at the dense-apply shape
 //
 //   mpirun -n 4 ./Test_ring_allreduce --grid 16.16.16.32 --mpi 1.1.2.2
 // (2D process grid so the cartesian variant exercises more than one ring)
@@ -100,6 +101,108 @@ int main(int argc, char **argv)
   Check<ComplexD>("ComplexD", grid, 1.0e-13);
   Check<RealF>   ("RealF   ", grid, 1.0e-5);
   Check<ComplexF>("ComplexF", grid, 1.0e-5);
+
+  // T5: CartesianRingAllGather delivers blocks in LEX-coordinate order; the
+  // reference is the zero-padded GlobalSumVector in RANK order, compared
+  // through the lex->rank table (bitwise: no arithmetic on either path).
+  // On a machine where ranks are relabelled (Frontier OptimalCommunicator)
+  // this is the test that catches a rank/coordinate confusion.
+  {
+    int P=grid->ProcessorCount(), me=grid->ThisRank(), mylex=CartesianLexIndex(grid);
+    std::vector<int> l2r(P);
+    for(int lp=0; lp<P; lp++){ Coordinate pc(grid->_ndimension); Lexicographic::CoorFromIndex(pc, lp, grid->_processors); l2r[lp]=grid->RankFromProcessorCoor(pc); }
+    Report("T5 lex->rank table consistent for my rank", l2r[mylex]==me);
+    int perm=0; for(int lp=0;lp<P;lp++) if(l2r[lp]!=lp) perm=1;
+    std::cout << GridLogMessage << "  (ranks " << (perm ? "ARE" : "are not") << " permuted relative to lex coordinates on this run)" << std::endl;
+    for(uint64_t chunk : std::vector<uint64_t>({1,3,64,1000,65537})){
+      uint64_t n=chunk*P;
+      std::vector<ComplexD> h(n,ComplexD(0.0,0.0)), ref;
+      for(uint64_t i=0;i<chunk;i++) h[me*chunk+i]=Fill<ComplexD>(me*chunk+i,me);   // rank-order reference
+      ref=h; grid->GlobalSumVector(&ref[0],(int)n);
+      std::vector<ComplexD> hin(n,ComplexD(0.0,0.0));
+      for(uint64_t i=0;i<chunk;i++) hin[mylex*chunk+i]=h[me*chunk+i];              // my slot is my lex index
+      deviceVector<ComplexD> d(n); acceleratorCopyToDevice(&hin[0],&d[0],n*sizeof(ComplexD));
+      CartesianRingAllGather(grid,&d[0],chunk);
+      std::vector<ComplexD> out(n); acceleratorCopyFromDevice(&d[0],&out[0],n*sizeof(ComplexD));
+      int bad=0; for(int lp=0;lp<P;lp++) if(memcmp(&out[lp*chunk],&ref[(uint64_t)l2r[lp]*chunk],chunk*sizeof(ComplexD))!=0) bad=1;
+      RealD diff=bad; grid->GlobalSum(diff);
+      Report("T5 CartesianRingAllGather (lex blocks) bitwise == rank-order padded GlobalSumVector, ComplexD chunk="+std::to_string(chunk), diff==0.0);
+    }
+    { uint64_t chunk=1001, n=chunk*P;
+      std::vector<ComplexF> h(n,ComplexF(0.0,0.0)), ref;
+      for(uint64_t i=0;i<chunk;i++) h[me*chunk+i]=Fill<ComplexF>(me*chunk+i,me);
+      ref=h; grid->GlobalSumVector(&ref[0],(int)n);
+      std::vector<ComplexF> hin(n,ComplexF(0.0,0.0)); for(uint64_t i=0;i<chunk;i++) hin[mylex*chunk+i]=h[me*chunk+i];
+      deviceVector<ComplexF> d(n); acceleratorCopyToDevice(&hin[0],&d[0],n*sizeof(ComplexF));
+      CartesianRingAllGather(grid,&d[0],chunk);
+      std::vector<ComplexF> out(n); acceleratorCopyFromDevice(&d[0],&out[0],n*sizeof(ComplexF));
+      int bad=0; for(int lp=0;lp<P;lp++) if(memcmp(&out[lp*chunk],&ref[(uint64_t)l2r[lp]*chunk],chunk*sizeof(ComplexF))!=0) bad=1;
+      RealD diff=bad; grid->GlobalSum(diff);
+      Report("T5 CartesianRingAllGather bitwise, ComplexF chunk=1001", diff==0.0);
+    }
+    // timing: the dense-apply shape, N=138240 x 4 rhs of ComplexF, chunk = N*4/P
+    { uint64_t chunk=(uint64_t)138240*4/P, n=chunk*P;
+      deviceVector<ComplexF> d(n); std::vector<ComplexF> h(n,ComplexF(1.0,0.0)); acceleratorCopyToDevice(&h[0],&d[0],n*sizeof(ComplexF));
+      double t0=usecond(); CartesianRingAllGather(grid,&d[0],chunk); double t1=usecond();
+      acceleratorCopyToDevice(&h[0],&d[0],n*sizeof(ComplexF));
+      double t2=usecond(); CartesianRingAllReduce(grid,&d[0],n); double t3=usecond();
+      std::cout << GridLogMessage << "T5 timing N=138240 x 4 ComplexF (" << n*8/1.0e6 << " MB): allgather " << (t1-t0)/1000. << " ms, cartesian allreduce " << (t3-t2)/1000. << " ms" << std::endl;
+    }
+  }
+
+  // T6: orthogDim -- CartesianRingAllReduce(.., orthogDim=d) must equal the sum
+  // over ranks sharing my coordinate in d.  Reference: for each value c of that
+  // coordinate, GlobalSumVector of (my data if my coord==c else 0); keep c=mine.
+  {
+    int me=grid->ThisRank(); int Nd=grid->_ndimension;
+    uint64_t n=4099;
+    for(int d=-1; d<Nd; d++){
+      std::vector<ComplexD> h(n); for(uint64_t i=0;i<n;i++) h[i]=Fill<ComplexD>(i,me);
+      std::vector<ComplexD> ref(n,ComplexD(0.0,0.0));
+      int Pd = (d<0) ? 1 : grid->_processors[d];
+      int myc = (d<0) ? 0 : grid->_processor_coor[d];
+      for(int c=0;c<Pd;c++){
+        std::vector<ComplexD> m(n); for(uint64_t i=0;i<n;i++) m[i] = (myc==c) ? h[i] : ComplexD(0.0,0.0);
+        grid->GlobalSumVector(&m[0],(int)n);
+        if ( myc==c ) ref=m;
+      }
+      deviceVector<ComplexD> dv(n); acceleratorCopyToDevice(&h[0],&dv[0],n*sizeof(ComplexD));
+      CartesianRingAllReduce(grid,&dv[0],n,d);
+      std::vector<ComplexD> out(n); acceleratorCopyFromDevice(&dv[0],&out[0],n*sizeof(ComplexD));
+      double worst=0.0; for(uint64_t i=0;i<n;i++) worst=std::max(worst,Mag<ComplexD>(out[i]-ref[i]));
+      RealD w=worst; grid->GlobalMax(w);
+      std::ostringstream os; os<<"orthogDim="<<d<<" (P_d="<<Pd<<") worst abs "<<w;
+      Report("T6 CartesianRingAllReduce orthogDim == masked GlobalSumVector", w<1.0e-12, os.str());
+    }
+  }
+
+  // T7: single-dimension gather.  Reference for my line along d: pad my chunk
+  // at slot coor[d] of a P_d*chunk vector, mask by "other coordinates == this
+  // line", GlobalSumVector; loop over all lines so every rank gets its own.
+  {
+    int me=grid->ThisRank(); int Nd=grid->_ndimension;
+    for(int d=0; d<Nd; d++){
+      int Pd=grid->_processors[d]; if ( Pd==1 ) continue;
+      uint64_t chunk=1013, n=chunk*Pd;
+      int myc=grid->_processor_coor[d];
+      std::vector<ComplexD> pad(n,ComplexD(0.0,0.0));
+      for(uint64_t i=0;i<chunk;i++) pad[myc*chunk+i]=Fill<ComplexD>(i,me);
+      // line index = lex index of my coordinates with dim d removed
+      auto lineIndex=[&](void){ int idx=0,stride=1; for(int e=0;e<Nd;e++){ if(e==d) continue; idx+=grid->_processor_coor[e]*stride; stride*=grid->_processors[e]; } return idx; };
+      int nlines=grid->ProcessorCount()/Pd, myline=lineIndex();
+      std::vector<ComplexD> ref(n);
+      for(int L=0;L<nlines;L++){
+        std::vector<ComplexD> m(n); for(uint64_t i=0;i<n;i++) m[i]=(myline==L)?pad[i]:ComplexD(0.0,0.0);
+        grid->GlobalSumVector(&m[0],(int)n);
+        if ( myline==L ) ref=m;
+      }
+      deviceVector<ComplexD> dv(n); acceleratorCopyToDevice(&pad[0],&dv[0],n*sizeof(ComplexD));
+      CartesianRingAllGather(grid,&dv[0],chunk,d);
+      std::vector<ComplexD> out(n); acceleratorCopyFromDevice(&dv[0],&out[0],n*sizeof(ComplexD));
+      RealD diff=(memcmp(&out[0],&ref[0],n*sizeof(ComplexD))!=0)?1.0:0.0; grid->GlobalSum(diff);
+      Report("T7 CartesianRingAllGather(dim="+std::to_string(d)+") bitwise == masked reference, P_d="+std::to_string(Pd), diff==0.0);
+    }
+  }
 
   // T4 timing at 16 MB of ComplexF (the dense-apply size at 12 RHS is 13.3 MB)
   {

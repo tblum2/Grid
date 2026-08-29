@@ -27,8 +27,15 @@ NAMESPACE_BEGIN(Grid);
 // communicator-level primitive: needs only CartesianCommunicator.
 //
 //   RingAllReduce(comm, buf, n)           flat ring over all P ranks
-//   CartesianRingAllReduce(comm, buf, n)  ring along each processor dimension
-//                                         in turn (P_d ranks per ring)
+//   CartesianRingAllReduce(comm, buf, n, orthogDim=-1)
+//                                         ring along each processor dimension
+//                                         in turn (P_d ranks per ring).
+//                                         orthogDim in 0..Nd-1: that dimension is
+//                                         SKIPPED, so the result is the sum over
+//                                         all ranks sharing my coordinate in it
+//                                         (e.g. orthogDim=3: sum over each
+//                                         time-slice of processors separately).
+//                                         -1: all dimensions (full allreduce).
 //
 // Why: Cray MPICH device-buffer MPI_Allreduce aborts above ~8 MB (MPI_FLOAT,
 // measured 4.4 MB pass / 13.3 MB fail) and delivers 5.8 GB/s where P2P rings
@@ -95,11 +102,13 @@ void RingAllReduce(CartesianCommunicator *comm, T *buf, uint64_t n)
 }
 
 template<class T>
-void CartesianRingAllReduce(CartesianCommunicator *comm, T *buf, uint64_t n)
+void CartesianRingAllReduce(CartesianCommunicator *comm, T *buf, uint64_t n, int orthogDim=-1)
 {
   if ( comm->ProcessorCount()==1 || n==0 ) return;
   int Nd = comm->_ndimension;
+  GRID_ASSERT( orthogDim >= -1 && orthogDim < Nd );
   for(int d=0;d<Nd;d++){
+    if ( d==orthogDim ) continue;              // leave this dimension unsummed
     int P = comm->_processors[d];
     if ( P==1 ) continue;
     int me = comm->_processor_coor[d];
@@ -114,6 +123,82 @@ void CartesianRingAllReduce(CartesianCommunicator *comm, T *buf, uint64_t n)
     RingAllReduceCore(comm, w, &scratch[0], c, P, me, next, prev);
     acceleratorCopyDeviceToDevice((void *)w, (void *)buf, n*sizeof(T));
   }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Cartesian ring ALLGATHER, point-to-point only.
+//
+//   CartesianRingAllGather(comm, buf, chunk)
+//     buf holds P*chunk elements of T.  Block index = the Grid LEXICOGRAPHIC
+//     index of the owning process coordinate (dimension 0 fastest,
+//     Lexicographic::CoorFromIndex convention), NOT the MPI rank: on entry my
+//     chunk is at buf[CartesianLexIndex(comm)*chunk]; on exit block L is the
+//     chunk of the process at coordinate CoorFromIndex(L).  Map to ranks with
+//     comm->RankFromProcessorCoor.  (Ranks and coordinates are NOT related
+//     lexicographically on Frontier -- the OptimalCommunicator relabels ranks
+//     for shared-memory locality; assuming rank order gave a wrong inverse,
+//     VERIFY 0.9965, 2026-08-26.)
+//
+// Dimension by dimension from dimension 0 (fastest) upward: each stage is a
+// ring over the P_d ranks of that line, after which the held block is the
+// concatenation over that coordinate in the lexicographic nesting.  Bytes
+// sent per rank ~N = P*chunk in total (dominated by the last stage): 8x less
+// than a zero-padded CartesianRingAllReduce.  Steps: sum_d (P_d-1).  Exact.
+//
+// Written for the dense coarse-coarse apply (every rank owns rows of A^{-1}
+// and needs the whole x): 1.86 ms with the allreduce ring at 288 ranks was
+// wire speed but moved 35 MB per rank to deliver 4.4.
+/////////////////////////////////////////////////////////////////////////////
+inline int CartesianLexIndex(CartesianCommunicator *comm)
+{
+  int idx=0, stride=1;
+  for(int d=0; d<(int)comm->_ndimension; d++){ idx += comm->_processor_coor[d]*stride; stride *= comm->_processors[d]; }
+  return idx;
+}
+
+//
+//   CartesianRingAllGather(comm, buf, chunk, dim)   dim in 0..Nd-1: gather along
+//     ONE processor dimension only.  buf holds P_dim*chunk elements; on entry my
+//     chunk is at buf[coor[dim]*chunk], on exit block c is the chunk of the rank
+//     at coordinate c along dim with all other coordinates equal to mine.  Every
+//     rank of the line holds the same result (e.g. dim=3 after a
+//     CartesianRingAllReduce(orthogDim=3): the boss of each spatial line can then
+//     write the P_t-times-longer vector, not the P-times-longer one).
+/////////////////////////////////////////////////////////////////////////////
+template<class T>
+void CartesianRingAllGather(CartesianCommunicator *comm, T *buf, uint64_t chunk, int dim=-1)
+{
+  int P  = comm->ProcessorCount();
+  int Nd = comm->_ndimension;
+  GRID_ASSERT( dim >= -1 && dim < Nd );
+  if ( dim >= 0 ) P = comm->_processors[dim];      // ranks in my line along dim
+  if ( P==1 || chunk==0 ) return;
+  int mylex = (dim<0) ? CartesianLexIndex(comm) : comm->_processor_coor[dim];
+  deviceVector<T> work((uint64_t)P*chunk);
+  // ping-pong between buf and work; the held block lives at offset `off` in `cur`
+  T *cur = buf;       uint64_t off = (uint64_t)mylex*chunk;
+  T *oth = &work[0];
+  uint64_t blk = chunk;                        // elements in the held block
+  for(int d=0; d<Nd; d++){                     // dimension 0 first: it is the fastest lex index
+    if ( dim>=0 && d!=dim ) continue;          // single-dimension gather
+    int Pd = comm->_processors[d];
+    if ( Pd==1 ) continue;
+    int med = comm->_processor_coor[d];
+    int next, prev;
+    comm->ShiftedRanks(d, 1, prev, next);      // (dim, shift, source, dest)
+    GRID_ASSERT( (blk*sizeof(T))%4 == 0 );
+    acceleratorCopyDeviceToDevice((void *)(cur+off), (void *)(oth+(uint64_t)med*blk), blk*sizeof(T));
+    for(int t=1;t<Pd;t++){
+      int sendslot = (med - t + 1 + Pd) % Pd;
+      int recvslot = (med - t     + Pd) % Pd;
+      comm->SendToRecvFrom((void *)(oth+(uint64_t)sendslot*blk), next,
+                           (void *)(oth+(uint64_t)recvslot*blk), prev, blk*sizeof(T));
+    }
+    T *tmp = cur; cur = oth; oth = tmp; off = 0;
+    blk *= Pd;
+  }
+  GRID_ASSERT( blk == (uint64_t)P*chunk );
+  if ( cur != buf ) acceleratorCopyDeviceToDevice((void *)cur, (void *)buf, blk*sizeof(T));
 }
 
 NAMESPACE_END(Grid);

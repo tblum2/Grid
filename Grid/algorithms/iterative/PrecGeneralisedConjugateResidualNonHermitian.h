@@ -28,6 +28,7 @@ Author: Peter Boyle <paboyle@ph.ed.ac.uk>
 /*  END LEGAL */
 #ifndef GRID_PREC_GCR_NON_HERM_H
 #define GRID_PREC_GCR_NON_HERM_H
+#include <Grid/algorithms/iterative/GCRCoefficients.h>
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 //VPGCR Abe and Zhang, 2005.
@@ -79,6 +80,14 @@ public:
   // same applies and no reductions.  Off by default; boss rank prints.
   int  LogCoeffs = 0;
   void LogCoefficients(int l) { LogCoeffs = l; };
+  // Optional recorder of the per-step coefficients (means over calls), for
+  // replay by GCRReplaySmoother (Smoothers.h).  Records only; no effect on
+  // the iteration.
+  GCRCoefficients *Recorder = nullptr;
+  void SetCoefficientRecorder(GCRCoefficients *r) { Recorder = r; if(r) r->mmax = mmax; };
+  // Free the persistent history (e.g. when this solver is replaced by a
+  // replayed polynomial): re-made on the next call if ever needed again.
+  void ReleaseHistory(void) { q.clear(); p.clear(); qq.clear(); hist_grid = nullptr; };
 
   PrecGeneralisedConjugateResidualNonHermitian(RealD tol,Integer maxit,LinearOperatorBase<Field> &_Linop,LinearFunction<Field> &Prec,int _mmax,int _nstep) : 
     Tolerance(tol), 
@@ -223,6 +232,7 @@ public:
       LinalgTimer.Start();
       rq= innerProduct(q[peri_k],r); // what if rAr not real?
       a = rq/qq[peri_k];
+      if ( Recorder ) Recorder->RecordA(k,a);
 
       axpy(psi,a,p[peri_k],psi);         
 
@@ -274,6 +284,7 @@ public:
 	bcoef[back] = -bcoef[back]/qq[peri_back];
         if ( LogCoeffs ) bs<<" b["<<back<<"]="<<bcoef[back];
       }
+      if ( Recorder && northog ) Recorder->RecordB(k,bcoef);
       if ( northog ) {
 	axpyMulti(p[peri_kp],bcoef,pwin);
 	qq[peri_kp]=axpyMultiNorm(q[peri_kp],bcoef,qwin);

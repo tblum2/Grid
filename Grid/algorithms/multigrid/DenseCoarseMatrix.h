@@ -119,6 +119,10 @@ public:
   deviceVector<ComplexF>  dSlab;
   deviceVector<ComplexF>  dX;       // N x MRHS_MAX
   deviceVector<ComplexF>  dY;       // nrows x MRHS_MAX
+  deviceVector<ComplexF>  dG;       // N x MRHS_MAX lex-major staging for the allgather (devSum==4)
+  deviceVector<int>       dLex2Rank;// lex index of a process coordinate -> its rank (allgather block order -> row-block order)
+  deviceVector<int64_t>   dRm2G;    // rank-major index (rank*nrows + ss*nbasis + b) -> global column (gsite*nbasis + b) of x / the slab
+  int                     myLex;
   deviceVector<ComplexF>  dPartial; // NK x (nrows x MRHS_MAX)
   deviceVector<ComplexF*> aptrs;    // slab K-chunk pointers   (lda = N)
   deviceVector<ComplexF*> xptrs;    // X    K-chunk pointers   (ldb = N)
@@ -252,9 +256,31 @@ public:
       acceleratorCopyToDevice(&h[0],&cptrs[0],NK*sizeof(ComplexF*));
 
       devSum = getenv("DENSE_DEVICE_SUM") ? atoi(getenv("DENSE_DEVICE_SUM")) : 0;
-      const char *sumName[4] = {"host allreduce","DEVICE-buffer allreduce (GPU-aware MPI)",
-                                "DEVICE cartesian ring allreduce (P2P)","DEVICE flat ring allreduce (P2P)"};
-      GRID_ASSERT(devSum>=0 && devSum<=3);
+      const char *sumName[5] = {"host allreduce","DEVICE-buffer allreduce (GPU-aware MPI)",
+                                "DEVICE cartesian ring allreduce (P2P)","DEVICE flat ring allreduce (P2P)",
+                                "DEVICE cartesian ring ALLGATHER (P2P, ~8x fewer bytes than the padded allreduce)"};
+      GRID_ASSERT(devSum>=0 && devSum<=4);
+      if ( devSum==4 ) {
+        dG.resize((uint64_t)N*MRHS_MAX);
+        // allgather delivers blocks in lexicographic-coordinate order; the row
+        // blocks of x are in RANK order.  Same table as BuildRankMajorMap.
+        int P = grid->ProcessorCount();
+        std::vector<int> l2r(P);
+        for(int lp=0; lp<P; lp++){ Coordinate pc(nd); Lexicographic::CoorFromIndex(pc, lp, grid->_processors); l2r[lp] = grid->RankFromProcessorCoor(pc); }
+        dLex2Rank.resize(P);
+        acceleratorCopyToDevice(&l2r[0], &dLex2Rank[0], P*sizeof(int));
+        myLex = CartesianLexIndex(grid);
+        GRID_ASSERT( l2r[myLex] == grid->ThisRank() );
+        // x and the slab columns are in GLOBAL-SITE order (hX[myGsite*nbasis+b]);
+        // the gathered blocks are in RANK-MAJOR order (rank*nrows + ss*nbasis + b).
+        // On one rank the two coincide, which is how the laptop passed while
+        // Frontier VERIFYed 0.9965 (2026-08-27).  Scatter through the inverse map.
+        std::vector<int64_t> g2rm; BuildRankMajorMap(g2rm);
+        std::vector<int64_t> rm2g(N); for(int64_t g=0; g<N; g++) rm2g[g2rm[g]] = g;
+        for(int ss=0; ss<lsites; ss++) GRID_ASSERT( rm2g[(int64_t)grid->ThisRank()*nrows + (int64_t)ss*nbasis] == myGsite[ss]*nbasis );
+        dRm2G.resize(N);
+        acceleratorCopyToDevice(&rm2g[0], &dRm2G[0], N*sizeof(int64_t));
+      }
       std::cout << GridLogMessage << "DenseCoarseMatrix: slab resident on device ("
                 << sbytes/1024./1024. << " MB/rank), split-K NK=" << NK << " (Kc=" << Kc << "); "
                 << sumName[devSum] << std::endl;
@@ -957,7 +983,35 @@ public:
     int64_t  Kc = N / NK;
     double t1 = usecond();
     double t2, t3;
-    if (devSum) {
+    if (devSum==4) {
+      // ALLGATHER: x is not a reduction -- every rank owns the rows of x at
+      // global columns myGsite[ss]*nbasis+b (scattered by site coordinate, NOT
+      // a contiguous block) and needs all of it.  Only MY rows go host->device
+      // (nrows x nr, ~15 KB at nr=1), packed rank-major [r][ss*nbasis+b],
+      // gathered along the process grid, then scattered through rm2g into the
+      // column-major dX (ld = N, global-site columns) the split-K GEMM reads.
+      const uint64_t chunk = (uint64_t)nrows*nr;              // my block: [r][ss*nbasis+b]
+      { GRID_TRACE("DenseH2D");
+        std::vector<ComplexF> hG(chunk);
+        for(int r=0;r<nr;r++)
+          for(int ss=0; ss<lsites; ss++)
+            memcpy(&hG[(uint64_t)r*nrows + (uint64_t)ss*nbasis], &hX[(uint64_t)r*N + (uint64_t)myGsite[ss]*nbasis], nbasis*sizeof(ComplexF));
+        acceleratorCopyToDevice(&hG[0], &dG[(uint64_t)myLex*chunk], chunk*sizeof(ComplexF));   // my slot is my LEX index
+      }
+      t2 = usecond();
+      { GRID_TRACE("DenseAllgather");
+        CartesianRingAllGather(grid, (ComplexF *)&dG[0], chunk);
+        // scatter lex block L=[r][i] -> dX[r*N + rm2g[rank(L)*nrows + i]]
+        ComplexF *g = &dG[0]; ComplexF *x = &dX[0]; int *l2r = &dLex2Rank[0]; int64_t *rm2g = &dRm2G[0];
+        const int64_t nrw = nrows; const int64_t NN = N; const int nrr = nr;
+        accelerator_for(idx, (uint64_t)N*nr, 1, {
+          int64_t r = idx / NN;  int64_t gi = idx - r*NN;
+          int64_t L = gi / nrw;  int64_t i  = gi - L*nrw;
+          x[r*NN + rm2g[(int64_t)l2r[L]*nrw + i]] = g[L*(nrw*nrr) + r*nrw + i];
+        });
+      }
+      t3 = usecond();
+    } else if (devSum) {
       { GRID_TRACE("DenseH2D");
         acceleratorCopyToDevice(&hX[0],&dX[0],nX*sizeof(ComplexF));
       }
@@ -967,6 +1021,7 @@ public:
         //                      above ~8 MB: 12 RHS at N=138240 is 13.3 MB)
         // DENSE_DEVICE_SUM=2 : CartesianRingAllReduce, P2P only, no size cliff
         // DENSE_DEVICE_SUM=3 : flat RingAllReduce, P2P only
+        // DENSE_DEVICE_SUM=4 : CartesianRingAllGather (branch above)
         if      (devSum==2) CartesianRingAllReduce(grid,(ComplexF *)&dX[0],nX);
         else if (devSum==3) RingAllReduce(grid,(ComplexF *)&dX[0],nX);
         else                grid->GlobalSumVector((ComplexF *)&dX[0], (int)nX);
@@ -1156,7 +1211,7 @@ public:
     if ( getenv("DENSE_APPLY_PROFILE") ) {
       std::cout << GridLogMessage << "DenseCoarseMatrix: apply6D profile:"
                 << " pack "        << (t1-t0)/1000.0
-                << "  allreduce "  << tprof[0]/1000.0
+                << (devSum==4 ? "  allgather " : "  allreduce ")  << tprof[0]/1000.0
                 << "  H2D "        << tprof[1]/1000.0
                 << "  gemm+reduce "<< tprof[2]/1000.0
                 << "  D2H "        << tprof[3]/1000.0
